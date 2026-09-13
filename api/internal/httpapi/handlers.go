@@ -25,6 +25,13 @@ import (
 func NewRouter(st *store.Store) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// Match :voyage against the RAW (still percent-encoded) path and then
+	// unescape the captured value, so a voyage code containing a slash
+	// (e.g. "V/A") is reachable as /api/voyages/V%2FA/hatches/latest instead
+	// of silently turning into two path segments and 404. A genuinely invalid
+	// escape such as %zz never reaches Gin: net/http answers 400 itself.
+	r.UseRawPath = true
+	r.UnescapePathValues = true
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
 
@@ -34,6 +41,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 		api.POST("/assessments", createAssessment(st))
 		api.GET("/assessments", listAssessments(st))
 		api.GET("/assessments/:id", getAssessment(st))
+		api.GET("/voyages/:voyage/hatches/latest", latestHatches(st))
 	}
 	return r
 }
@@ -268,6 +276,55 @@ func listAssessments(st *store.Store) gin.HandlerFunc {
 			out = append(out, toDTO(a))
 		}
 		c.JSON(http.StatusOK, gin.H{"items": out})
+	}
+}
+
+// latestHatches serves the read-only voyage "hatch overview": one latest
+// snapshot per hatch of the voyage. It never mutates data and never returns
+// the per-detail comparison block; the store chooses the single latest row
+// per hatch by MAX(id). An unknown voyage is a normal 200 with an empty
+// items collection; only a malformed request (empty voyage segment) is a 4xx.
+func latestHatches(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		voyage := c.Param("voyage")
+		if voyage == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请求路径错误：航次代号路径段不能为空"})
+			return
+		}
+		list, err := st.LatestByVoyage(c.Request.Context(), voyage)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		out := make([]gin.H, 0, len(list))
+		for _, a := range list {
+			out = append(out, toSnapshotDTO(a))
+		}
+		c.JSON(http.StatusOK, gin.H{"voyage": voyage, "items": out})
+	}
+}
+
+// toSnapshotDTO renders one latest-per-hatch row for the voyage overview. It
+// is deliberately a leaner, read-only shape than toDTO: no formula block
+// (that lives on the detail page the row links to) and no comparison block
+// (which exists only on detail responses).
+func toSnapshotDTO(a *store.Assessment) gin.H {
+	r := a.Result
+	return gin.H{
+		"id":            a.ID,
+		"voyage":        a.Input.Voyage,
+		"hatch":         a.Input.Hatch,
+		"tg":            a.Input.Tg,
+		"ta":            a.Input.Ta,
+		"rh":            a.Input.RH,
+		"gamma":         r.Gamma,
+		"td":            r.Td,
+		"delta":         r.Delta,
+		"gamma_display": r.GammaDisplay,
+		"td_display":    r.TdDisplay,
+		"delta_display": r.DeltaDisplay,
+		"verdict":       r.Verdict,
+		"created_at":    a.CreatedAt.Format(time.RFC3339Nano),
 	}
 }
 

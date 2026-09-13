@@ -101,7 +101,7 @@ api/
   internal/httpapi/      Gin 路由、422 字段错误、公式代入明细
 web/
   src/lib/api.js         仅做 fetch，不含任何公式
-  src/pages/             录入页 HomePage、详情页 DetailPage
+  src/pages/             录入页 HomePage、详情页 DetailPage、舱位概览页 OverviewPage
   src/components/        VerdictBadge 等展示组件
   test/unit/             Vitest 单元/组件测试
   test/e2e/              Playwright 端到端（真实 Gin + SQLite）
@@ -136,7 +136,7 @@ api/web 健康后依次执行：
 
 1. `go test ./...`（testify 单元 + HTTP/SQLite 集成测试）；
 2. `verify/acceptance.mjs`：**独立复写** Magnus 公式核对真实 API 的数值与结论，
-   校验刷新一致性、两个临界端点、422 不落库；
+   校验刷新一致性、两个临界端点、422 不落库，以及舱位概览按 `MAX(id)` 取每舱最新项；
 3. Playwright/Chromium 经 nginx → Gin → SQLite 跑浏览器端到端。
 
 ```bash
@@ -183,6 +183,7 @@ npm run dev
 | POST | `/api/assessments` | 提交一次评估；成功 201，请求体格式错误 400，字段非法 422 |
 | GET | `/api/assessments` | 列表（最新在前） |
 | GET | `/api/assessments/:id` | 详情，含公式逐行代入字符串；复测记录另含可选前序对照 `comparison` |
+| GET | `/api/voyages/:voyage/hatches/latest` | 舱位概览（只读）：该航次每个舱号各一条**最新**快照，按舱号升序 |
 
 成功响应（节选）：
 
@@ -273,6 +274,51 @@ npm run dev
 
 页面据此显示“首次测量”提示、对照卡（含前序摘要链接与五项未舍入变化量）或
 “前序对照不可用”的明确告警。
+
+### 舱位概览（按航次，只读）
+
+抵港交接时，大副要在同一航次的多舱记录里快速确认**各舱当前风险**，不必逐条
+打开历史详情，也不能把较早的测量误当成当前依据。历史区为每个出现过的航次
+提供一个“舱位概览”入口：
+
+```
+GET /api/voyages/:voyage/hatches/latest
+```
+
+- 服务端按 `voyage` 过滤、按 `hatch` 分组，以**最大记录编号 `MAX(id)`** 确定
+  每个舱号唯一的最新项——不看 `created_at` 文本，因此交错提交、甚至同一
+  纳秒时间戳（或时钟回拨的旧时间戳）都不会选错记录；判定口径与“最新=创建
+  顺序最后一条”一致。
+- 结果按**舱号升序**稳定排序（同舱号再以 id 兜底），多次读取顺序一致。
+- 仅返回该航次本舱记录；同舱号但属于其他航次的行绝不串入。
+- **航次不存在**时是正常的 `200` + 空集合：`{"voyage":…,"items":[]}`，不是错误。
+- 航次代号含 `/` 时用百分号编码访问（`V/A` → `/api/voyages/V%2FA/...`），
+  路由按原始路径匹配并反转义；**非法路径编码**（如 `%zz`、残缺的 `%`）由
+  net/http 在进入处理前直接以 **400** 拒绝，空航次段（`/voyages//...`）返回
+  明确的 400 请求错误；错误页保留“返回历史区”入口。
+
+响应是比详情更精简的只读快照（**不含** `formula` 与 `comparison`）：
+
+```json
+{
+  "voyage": "V-2026-09",
+  "items": [
+    {
+      "id": 12, "voyage": "V-2026-09", "hatch": "2P",
+      "tg": 26, "ta": 20, "rh": 70,
+      "gamma": 0.9826379171132591, "td": 14.359183217771522,
+      "delta": 11.640816782228478,
+      "gamma_display": 0.98, "td_display": 14.36, "delta_display": 11.64,
+      "verdict": "allowed",
+      "created_at": "2026-09-13T08:00:00Z"
+    }
+  ]
+}
+```
+
+页面逐行展示舱号、最新评估编号、测量时间、**未舍入 Δ** 与展示 Δ、结论，
+每一行可直接跳到该记录的原详情；页面完全渲染接口返回值，不在浏览器里挑选
+或重算“最新项”。该接口为只读，POST/列表/详情/前序关联及旧响应结构均不变。
 
 ### SQLite 迁移
 

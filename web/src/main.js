@@ -3,6 +3,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import App from './App.vue'
 import HomePage from './pages/HomePage.vue'
 import DetailPage from './pages/DetailPage.vue'
+import OverviewPage from './pages/OverviewPage.vue'
 import './styles.css'
 
 const router = createRouter({
@@ -10,6 +11,7 @@ const router = createRouter({
   routes: [
     { path: '/', name: 'home', component: HomePage },
     { path: '/assessments/:id', name: 'detail', component: DetailPage, props: true },
+    { path: '/voyages/:voyage/hatches/latest', name: 'overview', component: OverviewPage, props: true },
   ],
 })
 

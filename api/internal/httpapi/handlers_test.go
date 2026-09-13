@@ -1,14 +1,19 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -584,6 +589,210 @@ func TestHealthz(t *testing.T) {
 	r := setup(t)
 	w := do(t, r, http.MethodGet, "/api/healthz", nil)
 	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func submitOK(t *testing.T, r http.Handler, voyage, hatch string, tg float64) map[string]any {
+	t.Helper()
+	body := map[string]any{"voyage": voyage, "hatch": hatch, "tg": tg, "ta": 20.0, "rh": 70.0}
+	w, got := postMap(t, r, body)
+	require.Equal(t, http.StatusCreated, w, got)
+	return got
+}
+
+func getOverview(t *testing.T, r http.Handler, rawPath string) (int, map[string]any) {
+	t.Helper()
+	w := do(t, r, http.MethodGet, rawPath, nil)
+	var got map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	}
+	return w.Code, got
+}
+
+// End-to-end through Gin + SQLite: interleave two voyages and several
+// hatches, measuring one hatch repeatedly. The overview for the target
+// voyage must contain exactly that voyage's latest row per hatch, in stable
+// hatch order, and every row must link to the persisted record.
+func TestOverview_InterleavedLatestPerHatch(t *testing.T) {
+	r := setup(t)
+
+	// Interleave submissions of V-OV and V-OTHER across shared hatch numbers.
+	a1 := submitOK(t, r, "V-OV", "3H", 25)
+	submitOK(t, r, "V-OTHER", "3H", 5) // must never appear for V-OV
+	b1 := submitOK(t, r, "V-OV", "2P", 24)
+	a2 := submitOK(t, r, "V-OV", "3H", 23) // repeat measurement of 3H
+	submitOK(t, r, "V-OTHER", "4H", 6)
+	a3 := submitOK(t, r, "V-OV", "3H", 26) // latest 3H
+	c1 := submitOK(t, r, "V-OV", "4H", 20)
+
+	w, got := getOverview(t, r, "/api/voyages/V-OV/hatches/latest")
+	require.Equal(t, http.StatusOK, w, got)
+	assert.Equal(t, "V-OV", got["voyage"])
+
+	items, ok := got["items"].([]any)
+	require.True(t, ok)
+	require.Len(t, items, 3, "one snapshot per hatch, nothing from V-OTHER")
+
+	// Stable hatch-ascending order.
+	wantHatches := []string{"2P", "3H", "4H"}
+	byHatch := map[string]map[string]any{}
+	for i, it := range items {
+		row := it.(map[string]any)
+		assert.Equal(t, wantHatches[i], row["hatch"], "rows are sorted by hatch")
+		assert.Equal(t, "V-OV", row["voyage"])
+		byHatch[row["hatch"].(string)] = row
+	}
+
+	// The repeated hatch resolves to the biggest id (a3), never a1/a2.
+	latest3H := byHatch["3H"]
+	assert.Equal(t, a3["id"], latest3H["id"])
+	assert.NotEqual(t, a1["id"], latest3H["id"])
+	assert.NotEqual(t, a2["id"], latest3H["id"])
+	assert.Equal(t, a3["verdict"], latest3H["verdict"])
+	assert.Equal(t, b1["id"], byHatch["2P"]["id"])
+	assert.Equal(t, c1["id"], byHatch["4H"]["id"])
+
+	// The other voyage is independently correct (3H there is the other row).
+	w2, other := getOverview(t, r, "/api/voyages/V-OTHER/hatches/latest")
+	require.Equal(t, http.StatusOK, w2)
+	otherItems := other["items"].([]any)
+	require.Len(t, otherItems, 2)
+	for _, it := range otherItems {
+		assert.Equal(t, "V-OTHER", it.(map[string]any)["voyage"])
+	}
+}
+
+// Same created_at on every row (including the repeat) must not change which
+// record is picked: latestness follows MAX(id).
+func TestOverview_SameCreatedAtPicksMaxID(t *testing.T) {
+	st, r := setupWithStore(t)
+	ctx := context.Background()
+
+	first := submitOK(t, r, "V-TS", "1H", 25)
+	second := submitOK(t, r, "V-TS", "1H", 23) // latest by id
+	other := submitOK(t, r, "V-TS", "2H", 24)
+
+	// Collapse all timestamps to one identical value through the test seam.
+	same := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	for _, id := range []float64{first["id"].(float64), second["id"].(float64), other["id"].(float64)} {
+		require.NoError(t, st.SetCreatedAtForTest(ctx, int64(id), same))
+	}
+	// The later row is even back-dated relative to the earlier one.
+	require.NoError(t, st.SetCreatedAtForTest(ctx, int64(second["id"].(float64)),
+		same.Add(-time.Hour)))
+
+	w, got := getOverview(t, r, "/api/voyages/V-TS/hatches/latest")
+	require.Equal(t, http.StatusOK, w)
+	items := got["items"].([]any)
+	require.Len(t, items, 2)
+	row1 := items[0].(map[string]any)
+	assert.Equal(t, "1H", row1["hatch"])
+	assert.Equal(t, second["id"], row1["id"],
+		"MAX(id) wins even when the latest row has an earlier created_at")
+}
+
+// An unknown voyage is a normal 200 with an EMPTY items collection.
+func TestOverview_UnknownVoyageReturnsEmptyCollection(t *testing.T) {
+	r := setup(t)
+	submitOK(t, r, "V-KNOWN", "1H", 25)
+
+	w, got := getOverview(t, r, "/api/voyages/V-MISSING/hatches/latest")
+	require.Equal(t, http.StatusOK, w)
+	items, ok := got["items"].([]any)
+	require.True(t, ok)
+	assert.Empty(t, items)
+	assert.Equal(t, "V-MISSING", got["voyage"])
+}
+
+// An empty voyage path segment is an explicit request error, not a crash.
+func TestOverview_EmptyVoyageSegmentIsBadRequest(t *testing.T) {
+	r := setup(t)
+	w := do(t, r, http.MethodGet, "/api/voyages//hatches/latest", nil)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Contains(t, got["error"], "航次")
+}
+
+// A voyage code containing a slash is addressable via its percent-encoded
+// form; the value is unescaped before querying, so the row really matches.
+func TestOverview_PercentEncodedSlashInVoyage(t *testing.T) {
+	r := setup(t)
+	created := submitOK(t, r, "V/A-9", "3H", 25)
+
+	w, got := getOverview(t, r, "/api/voyages/V%2FA-9/hatches/latest")
+	require.Equal(t, http.StatusOK, w, got)
+	items := got["items"].([]any)
+	require.Len(t, items, 1)
+	assert.Equal(t, created["id"], items[0].(map[string]any)["id"])
+	assert.Equal(t, "V/A-9", items[0].(map[string]any)["voyage"])
+}
+
+// A genuinely malformed percent-escape is rejected as a 400 request error by
+// the HTTP stack before any handler runs. Exercise the real listener because
+// httptest.NewRequest rejects the bad URL while building the request.
+func TestOverview_MalformedPathEncodingIsBadRequest(t *testing.T) {
+	_, r := setupWithStore(t)
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	for _, target := range []string{
+		"/api/voyages/a%zz/hatches/latest",
+		"/api/voyages/%/hatches/latest",
+	} {
+		conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+		require.NoError(t, err)
+		fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n", target)
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, target)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		conn.Close()
+	}
+}
+
+// The overview snapshot is a lean read-only shape: no formula and no
+// comparison block, while POST/list/detail responses keep their old shapes.
+func TestOverview_SnapshotShapeDoesNotAffectExistingResponses(t *testing.T) {
+	r := setup(t)
+
+	first := submitOK(t, r, "V-SHAPE", "1H", 25)
+	second := submitOK(t, r, "V-SHAPE", "1H", 24)
+
+	w, got := getOverview(t, r, "/api/voyages/V-SHAPE/hatches/latest")
+	require.Equal(t, http.StatusOK, w)
+	snap := got["items"].([]any)[0].(map[string]any)
+	for _, key := range []string{"id", "voyage", "hatch", "tg", "ta", "rh",
+		"gamma", "td", "delta", "gamma_display", "td_display", "delta_display",
+		"verdict", "created_at"} {
+		assert.Contains(t, snap, key, "snapshot carries %s", key)
+	}
+	assert.NotContains(t, snap, "formula", "overview rows omit the formula block")
+	assert.NotContains(t, snap, "comparison", "overview rows omit the comparison block")
+
+	// POST response is unchanged (formula present, comparison absent).
+	assert.Contains(t, second, "formula")
+	assert.NotContains(t, second, "comparison")
+
+	// List items keep their old shape.
+	wl, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, wl)
+	for _, it := range list["items"].([]any) {
+		row := it.(map[string]any)
+		assert.Contains(t, row, "formula")
+		assert.NotContains(t, row, "comparison")
+	}
+
+	// Detail of the repeat still carries its comparison block.
+	wd, detail := getMap(t, r, "/api/assessments/"+
+		strconv.FormatFloat(second["id"].(float64), 'f', 0, 64))
+	require.Equal(t, http.StatusOK, wd)
+	assert.Contains(t, detail, "comparison")
+	assert.Equal(t, true, detail["comparison"].(map[string]any)["available"])
+	assert.Equal(t, first["id"],
+		detail["comparison"].(map[string]any)["previous"].(map[string]any)["id"])
 }
 
 // Guard against accidental constant drift.

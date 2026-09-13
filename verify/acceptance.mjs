@@ -110,6 +110,80 @@ async function main() {
   expect(chainList.items.every((i) => i.comparison === undefined),
     'list items never carry comparison blocks')
 
+  // 3c. Voyage "hatch overview": one LATEST snapshot per hatch, grouped by
+  // the server (MAX(id) per hatch), not filtered client-side. The probe
+  // independently derives the expected latest id per hatch from the full
+  // list, so a server that grouped on created_at or dropped a hatch fails.
+  const ovVoyage = 'ACCEPT-OV'
+  const ovOther = 'ACCEPT-OV-OTHER'
+  // Interleave two voyages across the same hatch numbers; 2P measured 3×.
+  const ovIds = []
+  ovIds.push((await post({ voyage: ovVoyage, hatch: '2P', tg: 24, ta: 20, rh: 70 })).body.id)
+  await post({ voyage: ovOther, hatch: '2P', tg: 5, ta: 28, rh: 95 })
+  ovIds.push((await post({ voyage: ovVoyage, hatch: '3H', tg: 25, ta: 20, rh: 70 })).body.id)
+  ovIds.push((await post({ voyage: ovVoyage, hatch: '2P', tg: 23, ta: 20, rh: 70 })).body.id)
+  await post({ voyage: ovOther, hatch: '3H', tg: 6, ta: 28, rh: 95 })
+  ovIds.push((await post({ voyage: ovVoyage, hatch: '2P', tg: 26, ta: 20, rh: 70 })).body.id)
+  ovIds.push((await post({ voyage: ovVoyage, hatch: '4H', tg: 16.357, ta: 20, rh: 70 })).body.id)
+
+  const overviewRes = await fetch(`${BASE}/api/voyages/${encodeURIComponent(ovVoyage)}/hatches/latest`)
+  expect(overviewRes.status === 200, `overview is 200 (got ${overviewRes.status})`)
+  const overview = await overviewRes.json()
+  expect(overview.voyage === ovVoyage, 'overview echoes the voyage code')
+
+  // Independent expectation from the full (newest-first) list.
+  const fullList = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items
+  const expectedLatest = {}
+  for (const it of fullList) {
+    if (it.voyage === ovVoyage && !(it.hatch in expectedLatest)) {
+      expectedLatest[it.hatch] = it // first seen per hatch is the latest
+    }
+  }
+  const expectedHatches = Object.keys(expectedLatest).sort()
+  expect(overview.items.length === expectedHatches.length,
+    `one snapshot per hatch: ${overview.items.length} == ${expectedHatches.length}`)
+  expect(overview.items.map((i) => i.hatch).join(',') === expectedHatches.join(','),
+    `rows sorted by hatch: ${overview.items.map((i) => i.hatch).join(',')}`)
+  for (const row of overview.items) {
+    expect(row.id === expectedLatest[row.hatch].id,
+      `${row.hatch} latest is record #${expectedLatest[row.hatch].id} (MAX id), got #${row.id}`)
+    expect(row.voyage === ovVoyage, 'no row leaks from the interleaved other voyage')
+    expect(row.comparison === undefined && row.formula === undefined,
+      'snapshot rows are a lean read-only shape')
+    // Values/verdict match the persisted latest record.
+    const src = expectedLatest[row.hatch]
+    expect(row.delta === src.delta && row.verdict === src.verdict,
+      `${row.hatch} snapshot carries the latest record's own Δ and verdict`)
+  }
+  // The repeated hatch 2P resolves to the third (largest) id.
+  const twoP = overview.items.find((i) => i.hatch === '2P')
+  expect(twoP.id === Math.max(...ovIds.slice(0, 1), ovIds[2], ovIds[3]) && twoP.id === ovIds[3],
+    'repeated measurements of 2P resolve to the newest record id')
+  // Its detail link really serves that record.
+  const linked = await fetch(`${BASE}/api/assessments/${twoP.id}`).then((r) => r.json())
+  expect(linked.id === twoP.id && linked.hatch === '2P', 'a snapshot row links to its own detail')
+
+  // The other voyage is grouped independently.
+  const otherOv = await fetch(`${BASE}/api/voyages/${encodeURIComponent(ovOther)}/hatches/latest`).then((r) => r.json())
+  expect(otherOv.items.length === 2 && otherOv.items.every((i) => i.voyage === ovOther),
+    'the other voyage overview never shares rows despite equal hatch numbers')
+
+  // Unknown voyage -> empty collection, not an error.
+  const emptyOvRes = await fetch(`${BASE}/api/voyages/ACCEPT-OV-NO-SUCH/hatches/latest`)
+  expect(emptyOvRes.status === 200, 'unknown voyage overview is still 200')
+  const emptyOv = await emptyOvRes.json()
+  expect(Array.isArray(emptyOv.items) && emptyOv.items.length === 0,
+    'unknown voyage returns an empty items collection')
+
+  // Malformed path percent-encoding -> explicit request error (400).
+  const badEnc = await fetch(`${BASE}/api/voyages/a%zz/hatches/latest`)
+  expect(badEnc.status === 400, `malformed path encoding is a 400 request error (got ${badEnc.status})`)
+
+  // Existing POST/list/detail shapes are untouched by the new endpoint.
+  const sampleDetail = await fetch(`${BASE}/api/assessments/${body.id}`).then((r) => r.json())
+  expect(sampleDetail.formula && sampleDetail.comparison === undefined,
+    'detail of the first measurement keeps formula and no comparison')
+
   // 4. Denied and retest zones.
   const denied = await post({ voyage: 'ACCEPT-2', hatch: '1P', tg: 5, ta: 28, rh: 95 })
   expect(denied.status === 201 && denied.body.verdict === 'denied',

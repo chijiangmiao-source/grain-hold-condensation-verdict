@@ -133,7 +133,14 @@ func (s *Store) Close() error { return s.db.Close() }
 // measurement for that voyage+hatch gets no predecessor. A rejected request
 // never reaches here, so 422s can never become a predecessor.
 func (s *Store) Create(ctx context.Context, in decision.Input, r decision.Result) (*Assessment, error) {
-	now := time.Now().UTC()
+	return s.createAt(ctx, in, r, time.Now().UTC())
+}
+
+// createAt is the clock-injectable core of Create. Production traffic always
+// goes through Create; tests call this directly to build rows that share a
+// creation timestamp (or carry a skewed one), proving the "latest per hatch"
+// query chooses by record id rather than by the timestamp text.
+func (s *Store) createAt(ctx context.Context, in decision.Input, r decision.Result, now time.Time) (*Assessment, error) {
 	createdAt := now.Format(time.RFC3339Nano)
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -208,6 +215,45 @@ FROM assessments WHERE id = ?`, id)
 	return scanAssessment(row)
 }
 
+// LatestByVoyage returns one snapshot per hatch of the given voyage: the
+// single most recently created assessment (largest id) for each distinct
+// hatch, never two rows for one hatch and never a row from another voyage.
+//
+// Latestness is decided by the record id (the monotone creation-order key),
+// NOT by created_at: submissions landing in the same nanosecond — or rows a
+// clock-skew test deliberately back-dates — still resolve to exactly one row
+// per hatch because the correlated subquery groups by hatch and takes
+// MAX(id). Results are sorted by hatch for a stable presentation, with id as
+// a deterministic tiebreaker. An unknown voyage yields an empty (non-nil)
+// slice.
+func (s *Store) LatestByVoyage(ctx context.Context, voyage string) ([]*Assessment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT a.id, a.voyage, a.hatch, a.tg, a.ta, a.rh,
+       a.gamma, a.td, a.delta, a.verdict, a.created_at, a.prev_id
+FROM assessments a
+JOIN (
+    SELECT hatch, MAX(id) AS max_id
+    FROM assessments
+    WHERE voyage = ?
+    GROUP BY hatch
+) latest ON latest.max_id = a.id
+ORDER BY a.hatch ASC, a.id ASC`, voyage)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*Assessment, 0)
+	for rows.Next() {
+		a, err := scanAssessment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -245,6 +291,19 @@ func (s *Store) SetPrevIDForTest(ctx context.Context, id, prevID int64) error {
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE assessments SET prev_id = ? WHERE id = ?`, prevID, id); err != nil {
 		return fmt.Errorf("set prev_id: %w", err)
+	}
+	return nil
+}
+
+// SetCreatedAtForTest is a narrow test seam that overwrites a row's creation
+// timestamp so HTTP-level tests can give two rows the SAME created_at (or a
+// skewed one) and prove latest-per-hatch selection uses MAX(id), not the
+// timestamp. Real traffic sets created_at once in Create. Tests only.
+func (s *Store) SetCreatedAtForTest(ctx context.Context, id int64, at time.Time) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE assessments SET created_at = ? WHERE id = ?`,
+		at.Format(time.RFC3339Nano), id); err != nil {
+		return fmt.Errorf("set created_at: %w", err)
 	}
 	return nil
 }

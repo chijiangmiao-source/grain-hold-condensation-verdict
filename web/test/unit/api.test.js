@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createAssessment, getAssessment, listAssessments } from '@/lib/api.js'
+import { createAssessment, getAssessment, getVoyageOverview, listAssessments } from '@/lib/api.js'
 
 describe('api client', () => {
   afterEach(() => vi.restoreAllMocks())
@@ -50,5 +50,22 @@ describe('api client', () => {
       expect.stringMatching(/\/api\/assessments$/),
       expect.stringMatching(/\/api\/assessments\/42$/),
     ])
+  })
+
+  it('builds the per-voyage overview url with an encoded voyage and returns grouped items', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        voyage: 'V/A',
+        items: [{ id: 9, hatch: '3H', verdict: 'allowed', delta: 10.64 }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    )
+
+    const res = await getVoyageOverview('V/A')
+
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(
+      /\/api\/voyages\/V%2FA\/hatches\/latest$/)
+    expect(res.status).toBe(200)
+    expect(res.data.items[0].id).toBe(9)
+    expect(res.data.items[0].verdict).toBe('allowed')
   })
 })

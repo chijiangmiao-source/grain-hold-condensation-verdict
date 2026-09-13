@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import { createAssessment, listAssessments } from '@/lib/api.js'
 import VerdictBadge from '@/components/VerdictBadge.vue'
@@ -93,6 +93,21 @@ async function submit() {
 
 const fmt2 = (v) => (v === null || v === undefined ? '—' : Number(v).toFixed(2))
 
+// Distinct voyage codes for the overview entry points. This is only a
+// navigation index built from the list; which record is "latest" per hatch is
+// decided entirely by the server overview endpoint, never here.
+const voyages = computed(() => {
+  const seen = new Set()
+  const out = []
+  for (const a of items.value) {
+    if (a.voyage && !seen.has(a.voyage)) {
+      seen.add(a.voyage)
+      out.push(a.voyage)
+    }
+  }
+  return out
+})
+
 onMounted(refreshList)
 </script>
 
@@ -145,23 +160,35 @@ onMounted(refreshList)
       <div class="card history">
         <h2>历史记录</h2>
         <p v-if="items.length === 0" class="note">暂无记录。</p>
-        <table v-else>
-          <thead>
-            <tr><th>#</th><th>航次/舱号</th><th>Tg</th><th>Ta</th><th>RH</th><th>Δ</th><th>结论</th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="a in items" :key="a.id">
-              <td><RouterLink :to="`/assessments/${a.id}`" class="link">{{ a.id }}</RouterLink></td>
-              <td>{{ a.voyage }} / {{ a.hatch }}</td>
-              <td>{{ fmt2(a.tg) }}</td>
-              <td>{{ fmt2(a.ta) }}</td>
-              <td>{{ fmt2(a.rh) }}</td>
-              <td :class="{ strong: true }">{{ fmt2(a.delta_display) }}</td>
-              <td><VerdictBadge :verdict="a.verdict" :hint="false" /></td>
-            </tr>
-          </tbody>
-        </table>
-        <p class="note">刷新页面后结论仍来自 SQLite 中保存的记录，页面不做二次复算。</p>
+        <template v-else>
+          <div class="voyage-entries" data-test="voyage-entries">
+            <span class="note">按航次查看舱位概览（每舱最新风险）：</span>
+            <RouterLink
+              v-for="v in voyages"
+              :key="v"
+              :to="`/voyages/${encodeURIComponent(v)}/hatches/latest`"
+              class="voyage-chip"
+              data-test="voyage-entry"
+            >{{ v }} →</RouterLink>
+          </div>
+          <table>
+            <thead>
+              <tr><th>#</th><th>航次/舱号</th><th>Tg</th><th>Ta</th><th>RH</th><th>Δ</th><th>结论</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="a in items" :key="a.id">
+                <td><RouterLink :to="`/assessments/${a.id}`" class="link">{{ a.id }}</RouterLink></td>
+                <td>{{ a.voyage }} / {{ a.hatch }}</td>
+                <td>{{ fmt2(a.tg) }}</td>
+                <td>{{ fmt2(a.ta) }}</td>
+                <td>{{ fmt2(a.rh) }}</td>
+                <td :class="{ strong: true }">{{ fmt2(a.delta_display) }}</td>
+                <td><VerdictBadge :verdict="a.verdict" :hint="false" /></td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="note">刷新页面后结论仍来自 SQLite 中保存的记录，页面不做二次复算。</p>
+        </template>
       </div>
     </div>
   </section>

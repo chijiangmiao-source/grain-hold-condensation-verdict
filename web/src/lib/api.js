@@ -24,6 +24,14 @@ export function getAssessment(id) {
   return fetch(`${BASE}/assessments/${encodeURIComponent(id)}`).then(parse)
 }
 
+// Read-only voyage overview: one latest snapshot per hatch, chosen by the
+// server with MAX(id) per hatch. The browser receives the already-grouped
+// items and only renders them; it never derives "latest" client-side.
+export function getVoyageOverview(voyage) {
+  return fetch(`${BASE}/voyages/${encodeURIComponent(voyage)}/hatches/latest`)
+    .then(parse)
+}
+
 export async function createAssessment(payload) {
   const res = await fetch(`${BASE}/assessments`, {
     method: 'POST',

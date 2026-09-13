@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import HomePage from '@/pages/HomePage.vue'
 
 function mountPage() {
@@ -101,8 +102,7 @@ describe('HomePage form', () => {
     expect(w.text()).not.toContain('暂停并复测')
   })
 
-  it('posts the parsed numeric form and shows the returned result on success', async () => {
-    const created = {
+  it('posts the parsed numeric form and shows the returned result on success', async () => {    const created = {
       id: 11, voyage: 'V-1', hatch: '3H',
       tg: 25, ta: 20, rh: 70,
       gamma: 0.9826, gamma_display: 0.98,
@@ -132,5 +132,50 @@ describe('HomePage form', () => {
     expect(w.find('.result').exists()).toBe(true)
     expect(w.find('.result').text()).toContain('10.64')
     expect(w.find('.result').text()).toContain('允许通风')
+  })
+
+  it('offers one overview entry per distinct voyage, with an encoded link', async () => {
+    const items = [
+      { id: 3, voyage: 'V-1', hatch: '3H', tg: 25, ta: 20, rh: 70, delta_display: 10.64, verdict: 'allowed' },
+      { id: 2, voyage: 'V-2', hatch: '1H', tg: 5, ta: 28, rh: 95, delta_display: -22, verdict: 'denied' },
+      { id: 1, voyage: 'V-1', hatch: '2P', tg: 24, ta: 20, rh: 70, delta_display: 9.64, verdict: 'allowed' },
+    ]
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ items }), { status: 200 }),
+    )
+
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: '/', component: HomePage },
+        { path: '/voyages/:voyage/hatches/latest', component: { template: '<div/>' } },
+        { path: '/assessments/:id', component: { template: '<div/>' } },
+      ],
+    })
+    const w = mount(HomePage, { global: { plugins: [router] } })
+    await flushPromises()
+
+    const entries = w.findAll('[data-test=voyage-entry]')
+    // V-1 appears twice in history but yields only one entry.
+    expect(entries.map((a) => a.text())).toEqual(['V-1 →', 'V-2 →'])
+    expect(entries[0].attributes('href')).toBe('/voyages/V-1/hatches/latest')
+
+    // A voyage containing a slash is percent-encoded in the link.
+    const slashItem = { id: 4, voyage: 'V/A', hatch: '9H', tg: 25, ta: 20, rh: 70, delta_display: 10.64, verdict: 'allowed' }
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      new Response(JSON.stringify({ items: [slashItem, ...items] }), { status: 200 }),
+    )
+    const router2 = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: '/', component: HomePage },
+        { path: '/voyages/:voyage/hatches/latest', component: { template: '<div/>' } },
+        { path: '/assessments/:id', component: { template: '<div/>' } },
+      ],
+    })
+    const w2 = mount(HomePage, { global: { plugins: [router2] } })
+    await flushPromises()
+    const slashLink = w2.findAll('[data-test=voyage-entry]').find((a) => a.text().includes('V/A'))
+    expect(slashLink.attributes('href')).toBe('/voyages/V%2FA/hatches/latest')
   })
 })

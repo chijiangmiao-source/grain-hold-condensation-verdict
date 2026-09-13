@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -156,6 +157,140 @@ func TestStore_GetMissing(t *testing.T) {
 
 	_, err = st.Get(context.Background(), 999)
 	assert.ErrorIs(t, err, ErrNoRows)
+}
+
+// mustCreateAt is the timestamp-injecting counterpart of mustCreate: it lets
+// a test give two rows the SAME created_at so latest-per-hatch selection is
+// forced onto the record id instead of timestamp recency.
+func mustCreateAt(t *testing.T, ctx context.Context, st *Store, at time.Time, voyage, hatch string, tg float64) *Assessment {
+	t.Helper()
+	in := decision.Input{Voyage: voyage, Hatch: hatch, Tg: tg, Ta: 20, RH: 70}
+	r, err := decision.Evaluate(in)
+	require.NoError(t, err)
+	a, err := st.createAt(ctx, in, *r, at)
+	require.NoError(t, err)
+	return a
+}
+
+func TestStore_LatestByVoyage_InterleavedPicksMaxIDPerHatch(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	// Two voyages, several hatches, interleaved. One hatch (V-1/3H) is
+	// measured repeatedly. The overview must return exactly the MAX(id) row
+	// of EACH hatch of the requested voyage and nothing from V-2.
+	a1 := mustCreate(t, ctx, st, "V-1", "3H", 25) // V-1 3H #1
+	b1 := mustCreate(t, ctx, st, "V-1", "2P", 24) // V-1 2P only
+	x1 := mustCreate(t, ctx, st, "V-2", "3H", 5)  // same hatch no., other voyage
+	a2 := mustCreate(t, ctx, st, "V-1", "3H", 23) // V-1 3H #2
+	x2 := mustCreate(t, ctx, st, "V-2", "3H", 6)
+	a3 := mustCreate(t, ctx, st, "V-1", "3H", 26) // V-1 3H latest
+	c1 := mustCreate(t, ctx, st, "V-1", "4H", 20)
+
+	// The repeated measurements really are three distinct ids in order.
+	require.Less(t, a1.ID, a2.ID)
+	require.Less(t, a2.ID, a3.ID)
+	require.Less(t, x1.ID, x2.ID)
+
+	got, err := st.LatestByVoyage(ctx, "V-1")
+	require.NoError(t, err)
+	require.Len(t, got, 3, "one snapshot per hatch of V-1")
+
+	byHatch := map[string]*Assessment{}
+	for _, a := range got {
+		byHatch[a.Input.Hatch] = a
+		assert.Equal(t, "V-1", a.Input.Voyage, "no row may come from another voyage")
+	}
+	assert.Equal(t, a3.ID, byHatch["3H"].ID, "3H latest is the biggest id, not a1/a2")
+	assert.Equal(t, b1.ID, byHatch["2P"].ID)
+	assert.Equal(t, c1.ID, byHatch["4H"].ID)
+	// The snapshot carries the full persisted evaluation, not a stale copy.
+	assert.Equal(t, a3.Result.Verdict, byHatch["3H"].Result.Verdict)
+	assert.Equal(t, a3.Result.Delta, byHatch["3H"].Result.Delta)
+
+	// The V-2 hatch is isolated even though it shares the hatch number.
+	got2, err := st.LatestByVoyage(ctx, "V-2")
+	require.NoError(t, err)
+	require.Len(t, got2, 1)
+	assert.Equal(t, x2.ID, got2[0].ID)
+	assert.Equal(t, "V-2", got2[0].Input.Voyage)
+}
+
+// Same created_at for every row (including the repeated measurements) must
+// not change which record is chosen: latestness follows MAX(id), not the
+// timestamp. A deliberately back-dated newer row proves the same point.
+func TestStore_LatestByVoyage_SameTimestampPicksByID(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	base := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+
+	// Two rows for the same hatch with an IDENTICAL created_at: the later
+	// inserted id must win.
+	same1 := mustCreateAt(t, ctx, st, base, "V-T", "1H", 25)
+	same2 := mustCreateAt(t, ctx, st, base, "V-T", "1H", 23)
+	require.NotEqual(t, same1.ID, same2.ID)
+
+	// A third row that is newer by id but EARLIER by its (skewed) timestamp
+	// must still win: id is the source of truth for latestness.
+	skewed := mustCreateAt(t, ctx, st, base.Add(-time.Hour), "V-T", "1H", 26)
+
+	// Another hatch, same shared timestamp, anchors the ordering check.
+	other := mustCreateAt(t, ctx, st, base, "V-T", "2H", 24)
+
+	got, err := st.LatestByVoyage(ctx, "V-T")
+	require.NoError(t, err)
+	require.Len(t, got, 2, "exactly one row per hatch despite equal timestamps")
+
+	assert.Equal(t, "1H", got[0].Input.Hatch, "sorted by hatch ascending")
+	assert.Equal(t, "2H", got[1].Input.Hatch)
+	assert.Equal(t, skewed.ID, got[0].ID,
+		"latest is MAX(id) even though its created_at is earlier")
+	assert.Equal(t, other.ID, got[1].ID)
+}
+
+// Hatch ordering is stable and deterministic: hatch ascending, then id.
+func TestStore_LatestByVoyage_StableHatchOrdering(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	// Insert in scrambled hatch order.
+	for _, hatch := range []string{"4H", "1H", "3H", "2H"} {
+		mustCreate(t, ctx, st, "V-O", hatch, 25)
+	}
+	got, err := st.LatestByVoyage(ctx, "V-O")
+	require.NoError(t, err)
+	require.Len(t, got, 4)
+	assert.Equal(t, []string{"1H", "2H", "3H", "4H"},
+		[]string{got[0].Input.Hatch, got[1].Input.Hatch, got[2].Input.Hatch, got[3].Input.Hatch})
+
+	// Calling twice returns the same order (no GROUP BY rowid jitter).
+	gotAgain, err := st.LatestByVoyage(ctx, "V-O")
+	require.NoError(t, err)
+	for i := range got {
+		assert.Equal(t, got[i].ID, gotAgain[i].ID)
+	}
+}
+
+// An unknown voyage is an empty non-nil collection, never an error.
+func TestStore_LatestByVoyage_UnknownVoyageIsEmpty(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	mustCreate(t, ctx, st, "V-KNOWN", "1H", 25)
+
+	got, err := st.LatestByVoyage(ctx, "V-DOES-NOT-EXIST")
+	require.NoError(t, err)
+	require.NotNil(t, got, "unknown voyage returns an empty slice, not nil")
+	assert.Empty(t, got)
 }
 
 // TestStore_MigrateFromOldSchema is the storage regression: a database file
