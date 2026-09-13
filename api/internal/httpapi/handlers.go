@@ -1,0 +1,231 @@
+// Package httpapi exposes the JSON API. The handlers never compute the
+// dew-point themselves: decision.Evaluate is the only implementation and
+// the page renders exactly what the API returns.
+package httpapi
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"grain-ventilation/internal/decision"
+	"grain-ventilation/internal/store"
+)
+
+// NewRouter builds the Gin engine with all routes.
+func NewRouter(st *store.Store) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(gin.Logger())
+
+	api := r.Group("/api")
+	{
+		api.GET("/healthz", healthz)
+		api.POST("/assessments", createAssessment(st))
+		api.GET("/assessments", listAssessments(st))
+		api.GET("/assessments/:id", getAssessment(st))
+	}
+	return r
+}
+
+func healthz(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func createAssessment(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Decode into raw messages so a bad value in one field does not
+		// abort the others: every offending field is reported in one 422.
+		var raw map[string]json.RawMessage
+		dec := json.NewDecoder(c.Request.Body)
+		if err := dec.Decode(&raw); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "请求体不是合法的 JSON",
+				"details": err.Error(),
+			})
+			return
+		}
+		if dec.More() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请求体在单个 JSON 对象后含有多余内容"})
+			return
+		}
+
+		allowed := map[string]bool{"voyage": true, "hatch": true, "tg": true, "ta": true, "rh": true}
+		for k := range raw {
+			if !allowed[k] {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "出现未知字段: " + k})
+				return
+			}
+		}
+
+		var in decision.Input
+		var bad []decision.FieldError
+
+		parseString := func(field string, dst *string, label string) {
+			b, ok := raw[field]
+			if !ok || string(b) == "null" {
+				bad = append(bad, decision.FieldError{Field: field, Code: "required", Message: label + "必须填写"})
+				return
+			}
+			var s string
+			if err := json.Unmarshal(b, &s); err != nil {
+				bad = append(bad, decision.FieldError{Field: field, Code: "wrong_type", Message: label + "必须是字符串"})
+				return
+			}
+			*dst = strings.TrimSpace(s)
+		}
+		parseNumber := func(field string, dst *float64, label string) {
+			b, ok := raw[field]
+			if !ok || string(b) == "null" {
+				bad = append(bad, decision.FieldError{Field: field, Code: "required", Message: label + "必须填写"})
+				return
+			}
+			var v float64
+			if err := json.Unmarshal(b, &v); err != nil {
+				// A JSON number that fails to decode (e.g. 1e999 -> +Inf)
+				// is non-finite; any other JSON value is the wrong type.
+				var ute *json.UnmarshalTypeError
+				if errors.As(err, &ute) && strings.HasPrefix(ute.Value, "number") {
+					bad = append(bad, decision.FieldError{Field: field, Code: "not_finite", Message: label + "必须为有限数值"})
+				} else {
+					bad = append(bad, decision.FieldError{Field: field, Code: "wrong_type", Message: label + "必须是数值"})
+				}
+				return
+			}
+			*dst = v
+		}
+
+		parseString("voyage", &in.Voyage, "航次代号")
+		parseString("hatch", &in.Hatch, "舱号")
+		parseNumber("tg", &in.Tg, "粮温 Tg")
+		parseNumber("ta", &in.Ta, "舱内气温 Ta")
+		parseNumber("rh", &in.RH, "相对湿度 RH")
+
+		// Range checks (and empty-string checks) live in decision.Validate so
+		// the rules cannot diverge from the math package. Missing fields keep
+		// their zero value, which may spuriously fail a range check too, so
+		// the response reports exactly one error per field.
+		res, err := decision.Evaluate(in)
+		var verr *decision.ValidationError
+		if errors.As(err, &verr) {
+			seen := map[string]bool{}
+			for _, f := range bad {
+				seen[f.Field] = true
+			}
+			for _, f := range verr.Fields {
+				if !seen[f.Field] {
+					bad = append(bad, f)
+					seen[f.Field] = true
+				}
+			}
+		} else if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if len(bad) > 0 {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":  "输入校验失败，未生成任何记录",
+				"fields": bad,
+			})
+			return
+		}
+
+		a, err := st.Create(c.Request.Context(), in, *res)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存失败: " + err.Error()})
+			return
+		}
+		c.JSON(http.StatusCreated, toDTO(a))
+	}
+}
+
+func listAssessments(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		list, err := st.List(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		out := make([]gin.H, 0, len(list))
+		for _, a := range list {
+			out = append(out, toDTO(a))
+		}
+		c.JSON(http.StatusOK, gin.H{"items": out})
+	}
+}
+
+func getAssessment(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "记录不存在"})
+			return
+		}
+		a, err := st.Get(c.Request.Context(), id)
+		if errors.Is(err, store.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "记录不存在"})
+			return
+		}
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, toDTO(a))
+	}
+}
+
+// toDTO renders one assessment for the client, including the fully
+// substituted formula lines so the detail page shows the API's own
+// arithmetic instead of recomputing it in JavaScript.
+func toDTO(a *store.Assessment) gin.H {
+	r := a.Result
+	return gin.H{
+		"id":            a.ID,
+		"voyage":        a.Input.Voyage,
+		"hatch":         a.Input.Hatch,
+		"tg":            a.Input.Tg,
+		"ta":            a.Input.Ta,
+		"rh":            a.Input.RH,
+		"gamma":         r.Gamma,
+		"td":            r.Td,
+		"delta":         r.Delta,
+		"gamma_display": r.GammaDisplay,
+		"td_display":    r.TdDisplay,
+		"delta_display": r.DeltaDisplay,
+		"verdict":       r.Verdict,
+		"formula":       buildFormula(a),
+		"created_at":    a.CreatedAt.Format(time.RFC3339Nano),
+	}
+}
+
+// num prints a float the shortest way that round-trips; whole numbers keep
+// no trailing ".0" noise inside the substituted expressions.
+func num(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+
+// raw prints a full-precision computed intermediate for the audit trail.
+func raw(v float64) string { return strconv.FormatFloat(v, 'f', 6, 64) }
+
+func buildFormula(a *store.Assessment) gin.H {
+	in, r := a.Input, a.Result
+	return gin.H{
+		// γ = ln(RH/100) + 17.62·Ta/(243.12+Ta)
+		"gamma_line": "γ = ln(RH/100) + 17.62 × Ta / (243.12 + Ta) = ln(" +
+			num(in.RH) + "/100) + 17.62 × " + num(in.Ta) + " / (243.12 + " +
+			num(in.Ta) + ") = " + raw(r.Gamma) + "（展示值 " + num(r.GammaDisplay) + "）",
+		// Td = 243.12·γ/(17.62-γ)
+		"td_line": "Td = 243.12 × γ / (17.62 − γ) = 243.12 × " + raw(r.Gamma) +
+			" / (17.62 − " + raw(r.Gamma) + ") = " + raw(r.Td) +
+			" ℃（展示值 " + num(r.TdDisplay) + " ℃）",
+		// Δ = Tg - Td, verdict on the UNROUNDED delta.
+		"delta_line": "Δ = Tg − Td = " + num(in.Tg) + " − " + raw(r.Td) + " = " +
+			raw(r.Delta) + " ℃（展示值 " + num(r.DeltaDisplay) + " ℃）",
+		"rule_line": "判定以未舍入 Δ 为准：Δ > 2.00 允许通风；Δ < −2.00 禁止通风；" +
+			"−2.00 ≤ Δ ≤ 2.00（含两端点）暂停并复测。",
+	}
+}
