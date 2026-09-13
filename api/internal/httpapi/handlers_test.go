@@ -470,6 +470,116 @@ func TestCreate_MissingAndWrongTypesAre422(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+// A structurally malformed body must be rejected as 400 (request body format
+// error) and never be persisted. In particular trailing content behind the
+// single JSON object must be caught even when it starts with ']': the old
+// Decoder.More() check read a stray ']' as an end-array token and falsely
+// reported end-of-stream, so the valid first half of the request was stored.
+func TestCreate_TrailingContentIsRejectedAndNotPersisted(t *testing.T) {
+	r := setup(t)
+	prefix := `{"voyage":"V-100","hatch":"4H","tg":25,"ta":20,"rh":70}`
+
+	for _, suffix := range []string{"]", " ]", " GARBAGE", `{"x":1}`, "123", ",null"} {
+		w := doRaw(t, r, prefix+suffix)
+		require.Equalf(t, http.StatusBadRequest, w.Code,
+			"trailing content %q must be rejected, got %d: %s", suffix, w.Code, w.Body.String())
+		var resp map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		errMsg, _ := resp["error"].(string)
+		assert.Contains(t, errMsg, "请求体", "suffix %q reports a body-level error", suffix)
+		assert.NotContains(t, resp, "fields", "suffix %q is not reported as field validation", suffix)
+	}
+
+	// No leading whitespace tricks either; and the empty body is a format
+	// error rather than five "field required" 422s.
+	for _, body := range []string{"", "   ", "\n\t"} {
+		w := doRaw(t, r, body)
+		require.Equal(t, http.StatusBadRequest, w.Code, "whitespace-only body %q", body)
+	}
+
+	// A well-formed submission after the rejected ones still succeeds...
+	okW := doRaw(t, r, prefix)
+	require.Equal(t, http.StatusCreated, okW.Code, okW.Body.String())
+
+	// ...and none of the rejected requests produced a record.
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	assert.Len(t, list["items"].([]any), 1, "no trailing-junk request may be persisted")
+}
+
+// A repeated key makes the request ambiguous: map unmarshalling silently keeps
+// the LAST value, so a field declared twice with different numbers used to be
+// accepted (and stored) with the final value. Such bodies must be rejected as
+// malformed regardless of whether the two values agree.
+func TestCreate_DuplicateKeysAreRejected(t *testing.T) {
+	r := setup(t)
+
+	bodies := []string{
+		// The reported case: same humidity field twice, different values.
+		`{"voyage":"V-100","hatch":"4H","tg":25,"ta":20,"rh":70,"rh":1}`,
+		// Whitespace/casing is irrelevant; a temperature field duplicated.
+		`{"voyage":"V-100","hatch":"4H","tg":25, "tg":26,"ta":20,"rh":70}`,
+		// Even identical values are a structural ambiguity.
+		`{"voyage":"V-100","hatch":"4H","tg":25,"ta":20,"rh":70,"rh":70}`,
+		// Text fields are covered by the same uniqueness rule.
+		`{"voyage":"V-100","voyage":"V-200","hatch":"4H","tg":25,"ta":20,"rh":70}`,
+	}
+	for _, body := range bodies {
+		w := doRaw(t, r, body)
+		require.Equalf(t, http.StatusBadRequest, w.Code,
+			"duplicate key must be rejected, got %d: %s", w.Code, w.Body.String())
+		var resp map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Contains(t, resp["error"], "重复声明")
+		assert.NotContains(t, resp, "fields")
+	}
+
+	// Nothing was stored, and the same payload without the duplicate is fine.
+	lw, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, lw)
+	assert.Empty(t, list["items"], "duplicate-key requests must never persist")
+
+	cleanW := doRaw(t, r, `{"voyage":"V-100","hatch":"4H","tg":25,"ta":20,"rh":70}`)
+	require.Equal(t, http.StatusCreated, cleanW.Code, cleanW.Body.String())
+}
+
+// A top-level null (or any non-object JSON document) is a request body format
+// error: 400 explaining the top level must be an object — not a 422 that
+// invents voyage/hatch/tg/ta/rh "required" errors for a document containing
+// none of those fields.
+func TestCreate_TopLevelNonObjectIsFormatError(t *testing.T) {
+	r := setup(t)
+
+	for _, body := range []string{"null", "[]", "123", `"voyage"`, "true"} {
+		w := doRaw(t, r, body)
+		require.Equalf(t, http.StatusBadRequest, w.Code,
+			"top-level %q must be a 400 format error, got %d", body, w.Code)
+		var resp map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Contains(t, resp["error"], "请求体格式错误", "body %q", body)
+		assert.NotContains(t, resp, "fields", "body %q must not fake per-field errors", body)
+	}
+
+	// null specifically must not masquerade as five missing fields.
+	w := doRaw(t, r, `null`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.NotContains(t, resp["error"], "必须填写")
+
+	// Structural validation only guards the document shape. A field whose
+	// value has the wrong JSON type remains an ordinary 422 field error, so
+	// value-level reporting is unchanged.
+	w = doRaw(t, r, `{"voyage":"v","hatch":"h","tg":{},"ta":20,"rh":70}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, w.Body.String())
+	var wrongType map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &wrongType))
+	wtFields := wrongType["fields"].([]any)
+	require.Len(t, wtFields, 1)
+	assert.Equal(t, "tg", wtFields[0].(map[string]any)["field"])
+	assert.Equal(t, "wrong_type", wtFields[0].(map[string]any)["code"])
+}
+
 func TestHealthz(t *testing.T) {
 	r := setup(t)
 	w := do(t, r, http.MethodGet, "/api/healthz", nil)

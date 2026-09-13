@@ -170,6 +170,29 @@ async function main() {
   const after = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
   expect(after === before, `no record persisted on 422 (${before} before, ${after} after)`)
 
+  // 6b. Structural/format errors are 400 (malformed request body), not 422
+  // field validation, and never persist a record.
+  const structBefore = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
+  const structCases = [
+    { raw: '{"voyage":"STRUCT","hatch":"H","tg":25,"ta":20,"rh":70}]', hint: 'stray ]' },
+    { raw: '{"voyage":"STRUCT","hatch":"H","tg":25,"ta":20,"rh":70} GARBAGE', hint: 'trailing text' },
+    { raw: '{"voyage":"STRUCT","hatch":"H","tg":25,"ta":20,"rh":70,"rh":1}', hint: 'duplicate key' },
+    { raw: 'null', hint: 'top-level null' },
+    { raw: '[]', hint: 'top-level array' },
+  ]
+  for (const c of structCases) {
+    const r = await post(c.raw)
+    expect(r.status === 400, `${c.hint} is rejected as 400 format error (got ${r.status})`)
+    expect(r.body && typeof r.body.error === 'string' && r.body.fields === undefined,
+      `${c.hint} reports a body-level error without fabricated field errors`)
+  }
+  const nullCase = await post('null')
+  expect(typeof nullCase.body.error === 'string' && nullCase.body.error.includes('格式错误'),
+    'top-level null is explicitly diagnosed as a request body format error')
+  const structAfter = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
+  expect(structAfter === structBefore,
+    `no record persisted on 400 (${structBefore} before, ${structAfter} after)`)
+
   console.log('\nALL ACCEPTANCE CHECKS PASSED')
 }
 

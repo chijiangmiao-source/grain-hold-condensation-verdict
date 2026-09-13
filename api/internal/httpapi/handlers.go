@@ -4,9 +4,12 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,19 +44,35 @@ func healthz(c *gin.Context) {
 
 func createAssessment(st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.Request.Body == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请求体为空，必须提交 JSON 对象"})
+			return
+		}
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求体失败: " + err.Error()})
+			return
+		}
+		// Structural validation before any field is parsed: the document must
+		// be exactly one JSON object, with no trailing bytes and no repeated
+		// keys. This closes two holes of decoding straight into a map:
+		// Decoder.More() mistakes a stray ']' for an end-array token and lets
+		// trailing junk pass, while map unmarshalling silently keeps the last
+		// value of a repeated key. A top-level null (or any other non-object)
+		// is a malformed request body here, not five "field required" errors.
+		if err := validateJSONObjectBody(body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
 		// Decode into raw messages so a bad value in one field does not
 		// abort the others: every offending field is reported in one 422.
 		var raw map[string]json.RawMessage
-		dec := json.NewDecoder(c.Request.Body)
-		if err := dec.Decode(&raw); err != nil {
+		if err := json.Unmarshal(body, &raw); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "请求体不是合法的 JSON",
 				"details": err.Error(),
 			})
-			return
-		}
-		if dec.More() {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "请求体在单个 JSON 对象后含有多余内容"})
 			return
 		}
 
@@ -144,6 +163,97 @@ func createAssessment(st *store.Store) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusCreated, toDTO(a))
 	}
+}
+
+// jsonContainer is one object/array frame while structurally walking a body.
+type jsonContainer struct {
+	isObject bool
+	wantKey  bool            // objects only: the next string token is a key
+	keys     map[string]bool // keys already declared in this object
+}
+
+// validateJSONObjectBody verifies body is exactly one JSON object and nothing
+// else. It enforces structural rules that decoding straight into a map cannot:
+//
+//   - no bytes may follow the object. Decoder.More() reads a stray ']' as an
+//     end-array token and falsely reports end-of-stream, so trailing brackets
+//     used to reach persistence;
+//   - object keys must be unique. Map unmarshalling keeps the LAST value of a
+//     repeated key, so an ambiguous request (same field declared twice with
+//     different numbers) used to be accepted with the final value;
+//   - the top level must be an object. A top-level null (or array/scalar) is a
+//     malformed body, not five spurious "field required" validation errors.
+//
+// Field-level value and range checks are deliberately left to the later 422
+// path so every offending field is still reported at once. UseNumber keeps
+// numeric literals such as 1e999 intact during the walk, letting them reach
+// the per-field not_finite check instead of failing here.
+func validateJSONObjectBody(body []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+
+	first, err := dec.Token()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("请求体为空，必须提交 JSON 对象")
+		}
+		return fmt.Errorf("请求体不是合法的 JSON: %v", err)
+	}
+	if d, ok := first.(json.Delim); !ok || d != '{' {
+		if first == nil {
+			return errors.New("请求体格式错误：请求体为 null，顶层必须是包含评估字段的 JSON 对象")
+		}
+		return errors.New("请求体格式错误：顶层必须是 JSON 对象")
+	}
+
+	frames := []jsonContainer{{isObject: true, wantKey: true, keys: map[string]bool{}}}
+	for len(frames) > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("请求体不是合法的 JSON: %v", err)
+		}
+		top := &frames[len(frames)-1]
+		if delim, ok := tok.(json.Delim); ok {
+			switch delim {
+			case '{', '[':
+				f := jsonContainer{isObject: delim == '{', wantKey: delim == '{'}
+				if f.isObject {
+					f.keys = map[string]bool{}
+				}
+				frames = append(frames, f)
+			case '}', ']':
+				frames = frames[:len(frames)-1]
+				// The closed container was one value of its parent object;
+				// the parent's next token (if any) is another key.
+				if len(frames) > 0 && frames[len(frames)-1].isObject {
+					frames[len(frames)-1].wantKey = true
+				}
+			}
+			continue
+		}
+		if s, isString := tok.(string); isString && top.isObject && top.wantKey {
+			if top.keys[s] {
+				return fmt.Errorf("请求体格式错误：字段 %q 重复声明，请求含义不唯一", s)
+			}
+			top.keys[s] = true
+			top.wantKey = false // the value token follows
+			continue
+		}
+		if top.isObject {
+			top.wantKey = true // scalar value consumed; next token is a key
+		}
+	}
+
+	// The root object has closed. Anything left in the stream is trailing
+	// junk; the next Token call (unlike Decoder.More) also catches a stray
+	// ']' that the scanner reports as an error.
+	if _, err := dec.Token(); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("请求体在单个 JSON 对象后含有非法内容: %v", err)
+		}
+		return errors.New("请求体在单个 JSON 对象后含有多余内容")
+	}
+	return nil
 }
 
 func listAssessments(st *store.Store) gin.HandlerFunc {
