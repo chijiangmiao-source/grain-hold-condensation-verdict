@@ -86,3 +86,19 @@ table.kv td:first-child { color: var(--muted); width: 46%; }
 .formula { padding-left: 22px; line-height: 2; font-size: 14px; font-variant-numeric: tabular-nums; }
 .formula .rule { color: var(--warn); }
 .meta { color: var(--muted); font-size: 13px; margin-top: -6px; }
+
+.first-measurement {
+  margin: 0 0 4px; padding: 10px 12px; border-radius: 7px;
+  background: #f2f5f9; border: 1px solid var(--line);
+}
+.compare { border: 1px solid #c9d8ea; border-radius: 9px; padding: 12px 14px; background: #f8fbff; }
+.compare-head { margin: 0 0 8px; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.compare-table th { font-size: 12px; }
+.compare-table td:nth-child(2),
+.compare-table td:nth-child(3) { white-space: nowrap; }
+.compare-unavailable {
+  padding: 11px 13px; border-radius: 8px;
+  border: 1px solid var(--warn); background: var(--warn-bg);
+}
+.compare-unavailable strong { color: var(--warn); font-size: 14px; }
+.compare-unavailable .note { margin: 4px 0 0; }

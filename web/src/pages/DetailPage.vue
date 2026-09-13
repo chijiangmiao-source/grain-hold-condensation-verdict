@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { getAssessment } from '@/lib/api.js'
 import VerdictBadge from '@/components/VerdictBadge.vue'
@@ -9,6 +9,29 @@ const record = ref(null)
 const status = ref('loading') // loading | ready | missing | error
 
 const fmt2 = (v) => (v === null || v === undefined ? '—' : Number(v).toFixed(2))
+
+// Change quantities are rendered exactly as the API returns them (unrounded).
+// The only client-side touch is a leading "+" for readability; the value
+// itself is never recomputed in the browser.
+function fmtChange(v) {
+  if (v === null || v === undefined) return '—'
+  const n = Number(v)
+  return (n > 0 ? '+' : '') + String(n)
+}
+
+const CHANGE_ROWS = [
+  { key: 'tg', label: '粮温 Tg 变化', unit: '℃' },
+  { key: 'ta', label: '舱内气温 Ta 变化', unit: '℃' },
+  { key: 'rh', label: '相对湿度 RH 变化', unit: '%' },
+  { key: 'td', label: '露点 Td 变化（未舍入）', unit: '℃' },
+  { key: 'delta', label: '温差 Δ 变化（未舍入）', unit: '℃' },
+]
+
+const comparison = computed(() => record.value?.comparison ?? null)
+const prev = computed(() => comparison.value?.previous ?? null)
+const changes = computed(() => comparison.value?.changes ?? null)
+const isFirstMeasurement = computed(() =>
+  status.value === 'ready' && comparison.value === null)
 
 async function load(id) {
   status.value = 'loading'
@@ -44,6 +67,42 @@ watch(() => props.id, (id) => load(id))
       <h2>评估明细 #{{ record.id }}</h2>
       <p class="meta">航次 {{ record.voyage }} · 舱号 {{ record.hatch }} · {{ new Date(record.created_at).toLocaleString() }}</p>
       <p>最终结论：<VerdictBadge :verdict="record.verdict" /></p>
+
+      <h3>与同舱前序记录的对照</h3>
+      <p v-if="isFirstMeasurement" class="note first-measurement" data-test="first-measurement">
+        本次为该航次该舱位的<b>首次测量</b>，尚无同舱前序有效记录可对照；
+        再次提交本舱测量后，将自动与本条记录关联。
+      </p>
+
+      <div v-else-if="comparison && comparison.available === false" class="compare-unavailable" data-test="compare-unavailable">
+        <strong>前序对照不可用</strong>
+        <p class="note">保存的前序记录编号 #{{ comparison.prev_id }}：{{ comparison.reason }}</p>
+      </div>
+
+      <div v-else-if="comparison && comparison.available" class="compare" data-test="compare-card">
+        <p class="compare-head">
+          对照前序记录
+          <RouterLink :to="`/assessments/${prev.id}`" class="link">#{{ prev.id }}</RouterLink>
+          <span class="meta">（{{ new Date(prev.created_at).toLocaleString() }}）</span>
+          <VerdictBadge :verdict="prev.verdict" :hint="false" />
+        </p>
+        <table class="kv compare-table">
+          <thead>
+            <tr><th>项目</th><th>前序 #{{ prev.id }}</th><th>本次 #{{ record.id }}</th><th>变化量（未舍入）</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in CHANGE_ROWS" :key="row.key">
+              <td>{{ row.label }}</td>
+              <td>{{ prev[row.key] }} {{ row.unit }}</td>
+              <td>{{ record[row.key] }} {{ row.unit }}</td>
+              <td class="strong">{{ fmtChange(changes[row.key]) }} {{ row.unit }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="note">变化量 = 本次 − 前序，由 Go API 使用<b>未舍入</b>值计算；页面只展示，不参与复算。
+          前序露点展示值 {{ fmt2(prev.td_display) }} ℃、温差展示值 {{ fmt2(prev.delta_display) }} ℃，
+          前序结论以 <VerdictBadge :verdict="prev.verdict" :hint="false" /> 为准。</p>
+      </div>
 
       <h3>录入值</h3>
       <table class="kv"><tbody>

@@ -4,6 +4,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -176,7 +177,15 @@ func getAssessment(st *store.Store) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(http.StatusOK, toDTO(a))
+		dto := toDTO(a)
+		// The detail endpoint additionally compares this assessment against
+		// the predecessor link fixed when it was created. A stale link
+		// (row deleted, or pointing at another voyage/hatch) never hides the
+		// current assessment: it is returned with comparison.available=false.
+		if a.HasPrev {
+			dto["comparison"] = buildComparison(c.Request.Context(), st, a)
+		}
+		c.JSON(http.StatusOK, dto)
 	}
 }
 
@@ -227,5 +236,76 @@ func buildFormula(a *store.Assessment) gin.H {
 			raw(r.Delta) + " ℃（展示值 " + num(r.DeltaDisplay) + " ℃）",
 		"rule_line": "判定以未舍入 Δ 为准：Δ > 2.00 允许通风；Δ < −2.00 禁止通风；" +
 			"−2.00 ≤ Δ ≤ 2.00（含两端点）暂停并复测。",
+	}
+}
+
+// buildComparison resolves the predecessor link saved with this assessment
+// and returns the traceable comparison block for the detail response. The
+// browser only renders these numbers: every unrounded delta (change) is
+// computed here in Go.
+//
+// If the saved predecessor no longer exists, or no longer belongs to the
+// same voyage and hatch, the current assessment is still returned and the
+// comparison is marked unavailable. The link is never rebound to another
+// record on the fly.
+func buildComparison(ctx context.Context, st *store.Store, a *store.Assessment) gin.H {
+	prev, err := st.Get(ctx, a.PrevID)
+	if errors.Is(err, store.ErrNoRows) {
+		return unavailable(a.PrevID, "保存的前序记录已不存在，无法形成对照")
+	}
+	if err != nil {
+		return gin.H{
+			"available": false,
+			"prev_id":   a.PrevID,
+			"reason":    "读取前序记录失败: " + err.Error(),
+		}
+	}
+	if prev.Input.Voyage != a.Input.Voyage || prev.Input.Hatch != a.Input.Hatch {
+		return unavailable(a.PrevID,
+			"保存的前序记录不属于同一航次同一舱位，对照不可用；未临时改绑其他记录")
+	}
+
+	return gin.H{
+		"available": true,
+		"previous":  prevSummary(prev),
+		// Unrounded current − previous for the five quantities the chief
+		// officer compares between consecutive measurements of one hatch.
+		"changes": gin.H{
+			"tg":    a.Input.Tg - prev.Input.Tg,         // 粮温变化
+			"ta":    a.Input.Ta - prev.Input.Ta,         // 气温变化
+			"rh":    a.Input.RH - prev.Input.RH,         // 湿度变化
+			"td":    a.Result.Td - prev.Result.Td,       // 露点变化
+			"delta": a.Result.Delta - prev.Result.Delta, // 温差变化
+		},
+	}
+}
+
+func unavailable(prevID int64, reason string) gin.H {
+	return gin.H{
+		"available": false,
+		"prev_id":   prevID,
+		"reason":    reason,
+	}
+}
+
+// prevSummary is the optional predecessor digest attached to a detail
+// response. It carries only display/audit fields, never another nested
+// comparison, so the payload stays one level deep.
+func prevSummary(p *store.Assessment) gin.H {
+	return gin.H{
+		"id":            p.ID,
+		"voyage":        p.Input.Voyage,
+		"hatch":         p.Input.Hatch,
+		"tg":            p.Input.Tg,
+		"ta":            p.Input.Ta,
+		"rh":            p.Input.RH,
+		"gamma":         p.Result.Gamma,
+		"td":            p.Result.Td,
+		"delta":         p.Result.Delta,
+		"gamma_display": p.Result.GammaDisplay,
+		"td_display":    p.Result.TdDisplay,
+		"delta_display": p.Result.DeltaDisplay,
+		"verdict":       p.Result.Verdict,
+		"created_at":    p.CreatedAt.Format(time.RFC3339Nano),
 	}
 }

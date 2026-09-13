@@ -64,6 +64,52 @@ async function main() {
     detail.formula.delta_line.includes('Δ = Tg − Td'),
     'detail page exposes the substituted formula lines')
 
+  // 3b. Traceable predecessor comparison for consecutive measurements of
+  // the same voyage+hatch. The probe independently computes the expected
+  // unrounded changes; the browser/API must not be trusted to subtract.
+  const chainVoyage = 'ACCEPT-CHAIN'
+  const m1 = { voyage: chainVoyage, hatch: '5H', tg: 25.345, ta: 20.123, rh: 71.5 }
+  const m2 = { voyage: chainVoyage, hatch: '5H', tg: 24.117, ta: 21.987, rh: 68.25 }
+  const c1 = await post(m1)
+  const c2 = await post(m2)
+  expect(c1.status === 201 && c2.status === 201, 'chain submissions are 201')
+  expect(c1.body.comparison === undefined, 'POST body never carries a comparison block')
+  expect(c2.body.comparison === undefined, 'POST body never carries a comparison block')
+
+  const d1 = await fetch(`${BASE}/api/assessments/${c1.body.id}`).then((r) => r.json())
+  expect(d1.comparison === undefined, 'first measurement has no comparison on detail either')
+
+  // An interleaved submission for a DIFFERENT hatch must not enter the chain.
+  const interleaved = await post({ voyage: chainVoyage, hatch: '6H', tg: 30, ta: 20, rh: 70 })
+  expect(interleaved.status === 201, 'interleaved hatch submission is 201')
+
+  const d2 = await fetch(`${BASE}/api/assessments/${c2.body.id}`).then((r) => r.json())
+  expect(d2.comparison && d2.comparison.available === true, 'second measurement has an available comparison')
+  expect(d2.comparison.previous.id === c1.body.id,
+    `predecessor is the prior same-hatch record #${c1.body.id}, not the interleaved hatch`)
+  expect(d2.comparison.previous.hatch === '5H', 'predecessor summary identifies the hatch')
+  const g1 = Math.log(m1.rh / 100) + (A * m1.ta) / (B + m1.ta)
+  const td1 = (B * g1) / (A - g1)
+  const g2 = Math.log(m2.rh / 100) + (A * m2.ta) / (B + m2.ta)
+  const td2 = (B * g2) / (A - g2)
+  const expectedChanges = {
+    tg: m2.tg - m1.tg,
+    ta: m2.ta - m1.ta,
+    rh: m2.rh - m1.rh,
+    td: td2 - td1,
+    delta: (m2.tg - td2) - (m1.tg - td1),
+  }
+  for (const [k, v] of Object.entries(expectedChanges)) {
+    expect(Math.abs(d2.comparison.changes[k] - v) < 1e-12,
+      `unrounded ${k} change matches independent math: api=${d2.comparison.changes[k]} expected=${v}`)
+  }
+  // The changes really are unrounded: at least one differs from its own 2-dp rounding.
+  expect(Object.values(d2.comparison.changes).some((v) => round2(v) !== v),
+    'comparison changes are delivered unrounded')
+  const chainList = await fetch(`${BASE}/api/assessments`).then((r) => r.json())
+  expect(chainList.items.every((i) => i.comparison === undefined),
+    'list items never carry comparison blocks')
+
   // 4. Denied and retest zones.
   const denied = await post({ voyage: 'ACCEPT-2', hatch: '1P', tg: 5, ta: 28, rh: 95 })
   expect(denied.status === 201 && denied.body.verdict === 'denied',

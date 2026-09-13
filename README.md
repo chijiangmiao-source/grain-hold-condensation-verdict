@@ -8,6 +8,11 @@
 均由 Go（Gin）API 计算并返回，SQLite 同时保存输入、未舍入中间量和结论，因此
 “页面一套、API 一套”不可能发生，合法提交刷新后结论仍然一致。
 
+同一航次同一舱位**连续测量**时，成功的提交会在**同一数据库事务**内锁定该舱按创建
+顺序的最近一条有效记录作为前序（首测无前序）；详情接口在此之上返回两者的未舍入
+变化量（粮温、气温、湿度、露点、温差），页面用首次测量提示或对照卡展示，浏览器
+同样不参与减法复算。
+
 ---
 
 ## 一、复算口径（务必以此为准）
@@ -92,7 +97,7 @@ SQLite 文件 (modernc.org/sqlite，纯 Go，静态编译；命名卷 api-data)
 api/
   cmd/server/            程序入口（API_PORT / DB_PATH 可配）
   internal/decision/     Magnus 公式、范围校验、区间判定（唯一计算口径）
-  internal/store/        SQLite 建表、增查（保存未舍入中间量）
+  internal/store/        SQLite 建表/增量迁移、增查（未舍入中间量 + 同舱前序 prev_id）
   internal/httpapi/      Gin 路由、422 字段错误、公式代入明细
 web/
   src/lib/api.js         仅做 fetch，不含任何公式
@@ -177,7 +182,7 @@ npm run dev
 | GET | `/api/healthz` | 健康检查 |
 | POST | `/api/assessments` | 提交一次评估；成功 201，非法 422 |
 | GET | `/api/assessments` | 列表（最新在前） |
-| GET | `/api/assessments/:id` | 详情，含公式逐行代入字符串 |
+| GET | `/api/assessments/:id` | 详情，含公式逐行代入字符串；复测记录另含可选前序对照 `comparison` |
 
 成功响应（节选）：
 
@@ -211,3 +216,52 @@ npm run dev
 ```
 
 详情页直接展示 `formula.*_line` 的代入文本与持久化的未舍入值，使审计口径一目了然。
+
+### 前序对照（仅详情接口）
+
+成功提交时，服务端在**同一事务**内按 `voyage + hatch` 找到按创建顺序（id）最近的
+前一条**有效**记录，把其编号存入新行的 `prev_id`：
+
+- 该航次该舱位的**首测**没有前序：POST、列表、详情的字段均与旧版一致（不含 `comparison`）；
+- 复测记录的**详情响应**在原字段上额外增加可选 `comparison`；POST 响应与列表项永不含该块；
+- 前序的选取只看同航次同舱，交错舱位提交不会串舱；422 不落库，也不会成为任何记录的前序。
+
+有可用前序时：
+
+```json
+"comparison": {
+  "available": true,
+  "previous": {
+    "id": 7, "voyage": "V-2026-09", "hatch": "3H",
+    "tg": 25.345, "ta": 20.123, "rh": 71.5,
+    "gamma": 1.051, "td": 15.359183217771522, "delta": 9.985816782228477,
+    "gamma_display": 1.05, "td_display": 15.36, "delta_display": 9.99,
+    "verdict": "allowed",
+    "created_at": "2026-09-12T00:00:00Z"
+  },
+  "changes": {
+    "tg": -1.227999999999998, "ta": 1.8639999999999972, "rh": -3.25,
+    "td": 1.058764057682854, "delta": -2.286764057682852
+  }
+}
+```
+
+`changes.*` 全部是 **Go 用未舍入 float64 计算的（本次 − 前序）**：粮温、气温、
+湿度、露点、温差五项，浏览器只渲染，不做减法。
+
+若保存的前序记录事后已不存在，或已不属于同一航次同一舱，当前评估照常返回，对照
+标记为不可用，**不会临时改绑**到其他记录：
+
+```json
+"comparison": { "available": false, "prev_id": 99, "reason": "保存的前序记录已不存在，无法形成对照" }
+```
+
+页面据此显示“首次测量”提示、对照卡（含前序摘要链接与五项未舍入变化量）或
+“前序对照不可用”的明确告警。
+
+### SQLite 迁移
+
+启动时自动建表并做**增量、无损**迁移：旧版数据库（无 `prev_id` 列）启动后通过
+`ALTER TABLE assessments ADD COLUMN prev_id INTEGER` 增加关联字段并补建
+`(voyage, hatch, id DESC)` 索引；历史行 `prev_id` 为 NULL（视作各舱首测），
+历史详情、列表顺序（id 倒序）与新记录创建均保持可用。

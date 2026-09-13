@@ -20,10 +20,16 @@ import (
 
 func setup(t *testing.T) *gin.Engine {
 	t.Helper()
+	_, r := setupWithStore(t)
+	return r
+}
+
+func setupWithStore(t *testing.T) (*store.Store, *gin.Engine) {
+	t.Helper()
 	st, err := store.Open(context.Background(), ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { st.Close() })
-	return NewRouter(st)
+	return st, NewRouter(st)
 }
 
 func do(t *testing.T, r http.Handler, method, path string, body any) *httptest.ResponseRecorder {
@@ -50,6 +56,230 @@ func doRaw(t *testing.T, r http.Handler, body string) *httptest.ResponseRecorder
 
 func validBody() map[string]any {
 	return map[string]any{"voyage": "V-100", "hatch": "4H", "tg": 25.0, "ta": 20.0, "rh": 70.0}
+}
+
+func postMap(t *testing.T, r http.Handler, body map[string]any) (int, map[string]any) {
+	t.Helper()
+	w := do(t, r, http.MethodPost, "/api/assessments", body)
+	var got map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	}
+	return w.Code, got
+}
+
+func getMap(t *testing.T, r http.Handler, path string) (int, map[string]any) {
+	t.Helper()
+	w := do(t, r, http.MethodGet, path, nil)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	return w.Code, got
+}
+
+// Interleaved submissions across voyages/hatches prove the predecessor link
+// is scoped by voyage AND hatch and follows creation order.
+func TestCreate_PredecessorLinkingInterleaved(t *testing.T) {
+	r := setup(t)
+
+	submit := func(voyage, hatch string, tg float64) map[string]any {
+		body := validBody()
+		body["voyage"], body["hatch"], body["tg"] = voyage, hatch, tg
+		w, got := postMap(t, r, body)
+		require.Equal(t, http.StatusCreated, w, got)
+		return got
+	}
+	detail := func(id float64) map[string]any {
+		w, got := getMap(t, r, "/api/assessments/"+strconv.FormatFloat(id, 'f', 0, 64))
+		require.Equal(t, http.StatusOK, w)
+		return got
+	}
+
+	a1 := submit("V-100", "4H", 25)
+	b1 := submit("V-100", "5H", 25)
+	c1 := submit("V-200", "4H", 25) // same hatch number, different voyage
+	a2 := submit("V-100", "4H", 24)
+	b2 := submit("V-100", "5H", 23)
+	c2 := submit("V-200", "4H", 22)
+	a3 := submit("V-100", "4H", 26)
+
+	// First measurements carry no comparison block at all.
+	assert.NotContains(t, detail(a1["id"].(float64)), "comparison")
+
+	expectPrev := func(cur, want map[string]any) {
+		t.Helper()
+		d := detail(cur["id"].(float64))
+		cmp, ok := d["comparison"].(map[string]any)
+		require.True(t, ok, "detail of a repeat measurement carries a comparison")
+		assert.Equal(t, true, cmp["available"])
+		prev := cmp["previous"].(map[string]any)
+		assert.Equal(t, want["id"], prev["id"])
+		assert.Equal(t, "V-100", prev["voyage"])
+	}
+	expectPrev(a2, a1)
+	expectPrev(b2, b1)
+
+	// The V-200 chain must never be linked to the identically-numbered V-100 hatch.
+	c2d := detail(c2["id"].(float64))
+	c2prev := c2d["comparison"].(map[string]any)["previous"].(map[string]any)
+	assert.Equal(t, c1["id"], c2prev["id"])
+	assert.Equal(t, "V-200", c2prev["voyage"])
+
+	// The chain follows creation order, not global recency.
+	expectPrev(a3, a2)
+
+	// Tg changed -1 with identical Ta/RH: unrounded Δ and Tg changes are
+	// exactly -1 and 0 respectively, and every change key is present.
+	a2cmp := detail(a2["id"].(float64))["comparison"].(map[string]any)
+	changes := a2cmp["changes"].(map[string]any)
+	for _, k := range []string{"tg", "ta", "rh", "td", "delta"} {
+		_, ok := changes[k]
+		assert.True(t, ok, "comparison.changes carries %s", k)
+	}
+	assert.Equal(t, -1.0, changes["tg"])
+	assert.Equal(t, 0.0, changes["ta"])
+	assert.Equal(t, 0.0, changes["rh"])
+	assert.Equal(t, 0.0, changes["td"])
+	assert.Equal(t, -1.0, changes["delta"])
+
+	// The comparison block exists ONLY on detail responses: the POST body
+	// and list items keep their original fields.
+	assert.NotContains(t, a2, "comparison")
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	for _, it := range list["items"].([]any) {
+		assert.NotContains(t, it.(map[string]any), "comparison")
+	}
+}
+
+// Change quantities must be the SERVER's unrounded subtraction, never a
+// rounded display delta and never something the browser could re-derive.
+func TestGet_ComparisonChangesAreUnrounded(t *testing.T) {
+	r := setup(t)
+
+	// Independent expected values from the decision package.
+	in1 := decision.Input{Voyage: "V-D", Hatch: "1P", Tg: 25.345, Ta: 20.123, RH: 71.5}
+	in2 := decision.Input{Voyage: "V-D", Hatch: "1P", Tg: 24.117, Ta: 21.987, RH: 68.25}
+	body1 := map[string]any{"voyage": "V-D", "hatch": "1P", "tg": in1.Tg, "ta": in1.Ta, "rh": in1.RH}
+	body2 := map[string]any{"voyage": "V-D", "hatch": "1P", "tg": in2.Tg, "ta": in2.Ta, "rh": in2.RH}
+
+	w, first := postMap(t, r, body1)
+	require.Equal(t, http.StatusCreated, w)
+	w, second := postMap(t, r, body2)
+	require.Equal(t, http.StatusCreated, w)
+
+	w, d := getMap(t, r, "/api/assessments/"+strconv.FormatFloat(second["id"].(float64), 'f', 0, 64))
+	require.Equal(t, http.StatusOK, w)
+	cmp := d["comparison"].(map[string]any)
+	assert.Equal(t, true, cmp["available"])
+	assert.Equal(t, first["id"], cmp["previous"].(map[string]any)["id"])
+
+	r1, err := decision.Evaluate(in1)
+	require.NoError(t, err)
+	r2, err := decision.Evaluate(in2)
+	require.NoError(t, err)
+
+	changes := cmp["changes"].(map[string]any)
+	assert.Equal(t, in2.Tg-in1.Tg, changes["tg"])
+	assert.Equal(t, in2.Ta-in1.Ta, changes["ta"])
+	assert.Equal(t, in2.RH-in1.RH, changes["rh"])
+	assert.Equal(t, r2.Td-r1.Td, changes["td"])
+	assert.Equal(t, r2.Delta-r1.Delta, changes["delta"])
+
+	// Pin that these are unrounded values: at least the delta change is not
+	// its own 2-dp rounding.
+	rawDeltaChange := r2.Delta - r1.Delta
+	assert.NotEqual(t, decision.Round2(rawDeltaChange), rawDeltaChange)
+	assert.Equal(t, rawDeltaChange, changes["delta"])
+
+	// The predecessor summary carries the previous verdict and persisted values.
+	prev := cmp["previous"].(map[string]any)
+	assert.Equal(t, r1.Verdict, prev["verdict"])
+	assert.Equal(t, r1.Td, prev["td"])
+	assert.Equal(t, r1.Delta, prev["delta"])
+}
+
+// A 422 between two valid measurements must not become a predecessor link.
+func TestCreate_RejectedSubmissionDoesNotEnterChain(t *testing.T) {
+	r := setup(t)
+	first := validBody()
+	w, a1 := postMap(t, r, first)
+	require.Equal(t, http.StatusCreated, w)
+
+	bad := validBody()
+	bad["tg"] = 999
+	bad["voyage"], bad["hatch"] = "V-100", "4H"
+	require.Equal(t, http.StatusUnprocessableEntity, do(t, r, http.MethodPost, "/api/assessments", bad).Code)
+
+	second := validBody()
+	second["tg"] = 24.0
+	w, a2 := postMap(t, r, second)
+	require.Equal(t, http.StatusCreated, w)
+
+	w, d := getMap(t, r, "/api/assessments/"+strconv.FormatFloat(a2["id"].(float64), 'f', 0, 64))
+	require.Equal(t, http.StatusOK, w)
+	cmp := d["comparison"].(map[string]any)
+	assert.Equal(t, true, cmp["available"])
+	assert.Equal(t, a1["id"], cmp["previous"].(map[string]any)["id"])
+}
+
+// Boundary: the saved predecessor vanished. The current assessment is still
+// returned normally with the comparison explicitly marked unavailable.
+func TestGet_ComparisonUnavailableWhenPredecessorMissing(t *testing.T) {
+	st, r := setupWithStore(t)
+
+	w, first := postMap(t, r, validBody())
+	require.Equal(t, http.StatusCreated, w)
+	secondBody := validBody()
+	secondBody["tg"] = 24.0
+	w, second := postMap(t, r, secondBody)
+	require.Equal(t, http.StatusCreated, w)
+
+	// Real traffic can never produce a dangling link; simulate one through
+	// the test seam (as if the predecessor row had been deleted).
+	require.NoError(t, st.SetPrevIDForTest(context.Background(),
+		int64(second["id"].(float64)), int64(first["id"].(float64))+9999))
+
+	w, d := getMap(t, r, "/api/assessments/"+strconv.FormatFloat(second["id"].(float64), 'f', 0, 64))
+	require.Equal(t, http.StatusOK, w, "current assessment is still returned")
+	assert.Equal(t, "allowed", d["verdict"])
+	assert.Equal(t, second["delta"], d["delta"])
+	cmp := d["comparison"].(map[string]any)
+	assert.Equal(t, false, cmp["available"])
+	assert.NotContains(t, cmp, "previous")
+	assert.NotContains(t, cmp, "changes")
+	assert.Contains(t, cmp["reason"], "已不存在")
+	assert.Equal(t, first["id"].(float64)+9999, cmp["prev_id"])
+}
+
+// Boundary: the saved predecessor exists but belongs to another voyage/hatch.
+// The comparison is marked unavailable and the API must not silently rebind
+// to some other same-hatch record.
+func TestGet_ComparisonUnavailableWhenPredecessorOtherChain(t *testing.T) {
+	st, r := setupWithStore(t)
+
+	w, other := postMap(t, r, map[string]any{"voyage": "V-OTHER", "hatch": "9H", "tg": 25, "ta": 20, "rh": 70})
+	require.Equal(t, http.StatusCreated, w)
+	// A genuine same-chain row exists too: it must never be rebound after
+	// the saved link is found to point at the other voyage/hatch.
+	w, _ = postMap(t, r, validBody())
+	require.Equal(t, http.StatusCreated, w)
+	secondBody := validBody()
+	secondBody["tg"] = 24.0
+	w, second := postMap(t, r, secondBody)
+	require.Equal(t, http.StatusCreated, w)
+
+	require.NoError(t, st.SetPrevIDForTest(context.Background(),
+		int64(second["id"].(float64)), int64(other["id"].(float64))))
+
+	w, d := getMap(t, r, "/api/assessments/"+strconv.FormatFloat(second["id"].(float64), 'f', 0, 64))
+	require.Equal(t, http.StatusOK, w)
+	assert.Equal(t, "allowed", d["verdict"])
+	cmp := d["comparison"].(map[string]any)
+	assert.Equal(t, false, cmp["available"])
+	assert.Contains(t, cmp["reason"], "同一航次同一舱")
+	assert.Contains(t, cmp["reason"], "未临时改绑")
+	assert.NotContains(t, cmp, "previous")
+	assert.Equal(t, other["id"], cmp["prev_id"])
 }
 
 func TestCreate_SuccessAndFormula(t *testing.T) {
