@@ -27,8 +27,16 @@ ASSERT_API_ORIGIN="$API" node "$ROOT/verify/acceptance.mjs"
 echo "==> [4/4] Browser E2E (Playwright/Chromium) through nginx -> Gin -> SQLite"
 cd "$ROOT/web"
 # Always (re)install inside the container: a bind-mounted node_modules may
-# contain host-OS binaries (e.g. macOS esbuild). Browsers come from the image.
+# contain host-OS binaries (e.g. macOS esbuild). PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+# keeps npm's postinstall from fetching browsers (they are baked into the image).
 npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+# Guarantee the browser revision matches the pinned @playwright/test package:
+# with versions aligned this is an instant no-op; if they ever drift it
+# downloads the matching Chromium instead of failing every page test with a
+# browser/driver version mismatch.
+echo "==> Ensuring Playwright browser revision matches $(node -p "require('@playwright/test/package.json').version")"
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD= npx playwright install chromium
 PLAYWRIGHT_BASE_URL="$WEB" npx playwright test
 
 echo
