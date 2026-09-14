@@ -58,14 +58,14 @@ watch(() => props.id, (id) => load(id))
     <div v-else-if="status === 'missing'" class="card" data-test="check-missing">
       <h2>稳健性核查不存在</h2>
       <p class="banner-error">核查编号 #{{ props.id }} 没有对应的核查记录，或已无法读取。</p>
-      <p class="note">核查为不可变记录，只能凭发起成功后获得的核查编号重新打开；也可从历史区找到原评估后重新发起。</p>
-      <p><RouterLink to="/" class="link">← 返回历史区（查找原评估）</RouterLink></p>
+      <p class="note">核查为不可变记录，只能凭发起成功后获得的核查编号重新打开；请返回历史区后再查找原评估或重新发起。</p>
+      <p><RouterLink to="/" class="link">← 返回历史区</RouterLink></p>
     </div>
 
     <div v-else-if="status === 'error'" class="card" data-test="check-error">
       <h2>稳健性核查读取失败</h2>
       <p class="banner-error">{{ errorMessage }}</p>
-      <p><RouterLink to="/" class="link">← 返回历史区（查找原评估）</RouterLink></p>
+      <p><RouterLink to="/" class="link">← 返回历史区</RouterLink></p>
     </div>
 
     <article v-else class="card" data-test="check-detail">

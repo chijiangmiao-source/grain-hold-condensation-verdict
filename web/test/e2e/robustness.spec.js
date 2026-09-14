@@ -205,15 +205,37 @@ test('illegal tolerances get explicit field feedback and never persist a check',
   await expect(page).toHaveURL(/\/robustness-checks\/new$/) // stayed on the form
 })
 
-test('an unknown check number keeps the entry back to the original assessment area', async ({ page, request }) => {
-  // Sanity: the API itself answers 404 for an unknown check.
+test('an unknown or unreadable check offers only the history entry, never a direct link back to the origin assessment', async ({ page, request }) => {
+  // --- 404: the check number does not exist ---
   const res = await request.get('/api/robustness-checks/888888')
   expect(res.status()).toBe(404)
 
   await page.goto('/robustness-checks/888888')
-  await expect(page.locator('[data-test=check-missing]')).toBeVisible()
-  const back = page.locator('[data-test=check-missing] a')
+  const missing = page.locator('[data-test=check-missing]')
+  await expect(missing).toBeVisible()
+  const back = missing.locator('a')
   await expect(back).toHaveAttribute('href', '/')
+
+  // No link anywhere on the page leads straight back to an origin assessment;
+  // the only way out is the history area.
+  expect(await page.locator('a[href^="/assessments/"]').count()).toBe(0)
+
   await back.click()
+  await expect(page).toHaveURL(/\/$/)
+
+  // --- 5xx: the check exists but reading it fails ---
+  await page.route('**/api/robustness-checks/777777', (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: '读取失败' }),
+    }))
+  await page.goto('/robustness-checks/777777')
+  const failed = page.locator('[data-test=check-error]')
+  await expect(failed).toBeVisible()
+  await expect(failed.locator('a')).toHaveAttribute('href', '/')
+  expect(await page.locator('a[href^="/assessments/"]').count()).toBe(0)
+
+  await failed.locator('a').click()
   await expect(page).toHaveURL(/\/$/)
 })

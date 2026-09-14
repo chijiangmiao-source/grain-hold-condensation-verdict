@@ -165,20 +165,32 @@ describe('RobustnessCheckPage', () => {
     expect(links).toContain('/assessments/6')
   })
 
-  it('shows a missing state that still keeps the entry back to the original assessment area', async () => {
+  it('on a missing check offers only the history entry, never a direct link back to the origin assessment', async () => {
     const { wrapper: w } = mountCheck({ error: '稳健性核查记录不存在' }, 404)
     await flushPromises()
 
     expect(w.find('[data-test=check-missing]').exists()).toBe(true)
     expect(w.find('[data-test=check-detail]').exists()).toBe(false)
-    const back = w.find('[data-test=check-missing] a')
-    expect(back.attributes('href')).toBe('/')
+
+    // The card's only action returns to history.
+    const cardLinks = w.find('[data-test=check-missing]').findAll('a')
+    expect(cardLinks.map((a) => a.attributes('href'))).toEqual(['/'])
+
+    // Nothing on the page links straight back to the origin assessment in
+    // this state: the origin id is unknown for an unreadable check.
+    const allLinks = w.findAll('a').map((a) => a.attributes('href'))
+    expect(allLinks.every((href) => !href.startsWith('/assessments/'))).toBe(true)
   })
 
-  it('shows a read-failure state with the way back to history', async () => {
+  it('on a read failure offers only the history entry, never a direct link back to the origin assessment', async () => {
     const { wrapper: w } = mountCheck({ error: 'boom' }, 500)
     await flushPromises()
+
     expect(w.find('[data-test=check-error]').exists()).toBe(true)
-    expect(w.find('[data-test=check-error] a').attributes('href')).toBe('/')
+    const cardLinks = w.find('[data-test=check-error]').findAll('a')
+    expect(cardLinks.map((a) => a.attributes('href'))).toEqual(['/'])
+
+    const allLinks = w.findAll('a').map((a) => a.attributes('href'))
+    expect(allLinks.every((href) => !href.startsWith('/assessments/'))).toBe(true)
   })
 })
