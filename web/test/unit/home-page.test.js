@@ -4,7 +4,16 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import HomePage from '@/pages/HomePage.vue'
 
 function mountPage() {
-  return mount(HomePage, { global: { stubs: { RouterLink: true } } })
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/', component: HomePage },
+      { path: '/robustness-checks/:id', component: { template: '<div/>' } },
+      { path: '/voyages/:voyage/hatches/latest', component: { template: '<div/>' } },
+      { path: '/assessments/:id', component: { template: '<div/>' } },
+    ],
+  })
+  return mount(HomePage, { global: { plugins: [router] } })
 }
 
 async function fill(wrapper, values) {
@@ -132,6 +141,26 @@ describe('HomePage form', () => {
     expect(w.find('.result').exists()).toBe(true)
     expect(w.find('.result').text()).toContain('10.64')
     expect(w.find('.result').text()).toContain('允许通风')
+  })
+
+  it('reopens a robustness check by its number and ignores non-numeric input', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"items":[]}', { status: 200 }),
+    )
+    const w = mountPage()
+    await flushPromises()
+    const router = w.vm.$router
+
+    // Non-numeric input never navigates.
+    await w.find('#check-id-input').setValue('abc')
+    await w.find('form[data-test=reopen-check]').trigger('submit.prevent')
+    expect(router.currentRoute.value.path).toBe('/')
+
+    // A numeric check number opens the independent check detail.
+    await w.find('#check-id-input').setValue('12')
+    await w.find('form[data-test=reopen-check]').trigger('submit.prevent')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/robustness-checks/12')
   })
 
   it('offers one overview entry per distinct voyage, with an encoded link', async () => {

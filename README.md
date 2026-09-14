@@ -97,11 +97,12 @@ SQLite 文件 (modernc.org/sqlite，纯 Go，静态编译；命名卷 api-data)
 api/
   cmd/server/            程序入口（API_PORT / DB_PATH 可配）
   internal/decision/     Magnus 公式、范围校验、区间判定（唯一计算口径）
-  internal/store/        SQLite 建表/增量迁移、增查（未舍入中间量 + 同舱前序 prev_id）
-  internal/httpapi/      Gin 路由、422 字段错误、公式代入明细
+  internal/store/        SQLite 建表/增量迁移、增查（未舍入中间量 + 同舱前序 prev_id + 独立 robustness_checks 核查表）
+  internal/httpapi/      Gin 路由、422 字段错误、公式代入明细、稳健性核查
 web/
   src/lib/api.js         仅做 fetch，不含任何公式
-  src/pages/             录入页 HomePage、详情页 DetailPage、舱位概览页 OverviewPage
+  src/pages/             录入页 HomePage、详情页 DetailPage、舱位概览页 OverviewPage、
+                         核查发起页 RobustnessLaunchPage、核查详情页 RobustnessCheckPage
   src/components/        VerdictBadge 等展示组件
   test/unit/             Vitest 单元/组件测试
   test/e2e/              Playwright 端到端（真实 Gin + SQLite）
@@ -138,7 +139,8 @@ api/web 健康后依次执行：
 2. `verify/acceptance.mjs`：**独立复写** Magnus 公式核对真实 API 的数值与结论，
    校验刷新一致性、两个临界端点、422 不落库，以及舱位概览按 `MAX(id)` 取每舱最新项；
    另用交错舱位与重复舱位验证**批量提交**的批内前序关联、概览最新项，以及中间行越界时
-   整批回滚（无部分记录、无断裂关联）；
+   整批回滚（无部分记录、无断裂关联）；并以独立公式逐组复算稳健性核查的**八组边界**，
+   验收稳定样本、跨结论敏感样本（含负侧）、非法误差不落库（不占编号）、原评估缺失与凭核查编号刷新一致；
 3. Playwright/Chromium 经 nginx → Gin → SQLite 跑浏览器端到端。
 
 ```bash
@@ -186,6 +188,8 @@ npm run dev
 | POST | `/api/assessments/batch` | 一次提交 **1～20 行**有序测量（批量抄录）；成功 201，结构/格式错误 400，任一行字段非法 422（带行号，整批不落库） |
 | GET | `/api/assessments` | 列表（最新在前） |
 | GET | `/api/assessments/:id` | 详情，含公式逐行代入字符串；复测记录另含可选前序对照 `comparison` |
+| POST | `/api/assessments/:id/robustness-checks` | 以某条评估为中心发起一次**稳健性核查**；成功 201，原评估不存在/误差非法 422（逐字段反馈，不落库） |
+| GET | `/api/robustness-checks/:id` | 按**核查编号**读取不可变核查详情（原评估快照、误差范围、八组边界结果、结论集合） |
 | GET | `/api/voyages/:voyage/hatches/latest` | 舱位概览（只读）：该航次每个舱号各一条**最新**快照，按舱号升序 |
 
 成功响应（节选）：
@@ -370,9 +374,79 @@ GET /api/voyages/:voyage/hatches/latest
 每一行可直接跳到该记录的原详情；页面完全渲染接口返回值，不在浏览器里挑选
 或重算“最新项”。该接口为只读，POST/列表/详情/前序关联及旧响应结构均不变。
 
+### 稳健性核查（仪表误差下的八组边界）
+
+海上仪表存在允许误差时，单次露点结论可能在真实值边界上翻转（Δ 未舍入值恰好贴近 ±2.00
+时尤为明显）。大副在**评估详情页**可发起一次稳健性核查，只填写粮温、气温、湿度三个
+**对称误差幅度**（±值）：
+
+```json
+{ "tg_eps": 0.01, "ta_eps": 0.01, "rh_eps": 0.5 }
+```
+
+- 原评估的 voyage/hatch 与 Tg/Ta/RH 一律取自被核查的那条记录，**请求体只含三个误差幅度**，
+  不接受（出现即 400）其他字段；
+- 服务端以原评估输入为中心，对三个量各取 **−ε / +ε**，按固定顺序生成 **2³ = 8 组**边界组合
+  （角点）：`---、--+、-+-、-++、+--、+-+、++-、+++`；
+- 每一组都调用**现有的 `decision.Evaluate` 未舍入露点判定**（与单条/批量录入同一套代码路径），
+  不另写公式、不在判定前舍入；
+- 保存内容：误差参数、原评估 DTO 的**不可变快照**、八组边界的输入与未舍入结果（γ/Td/Δ、
+  展示值、结论）、以及八组结论按首次出现顺序去重得到的**结论集合** `verdicts`；
+- 判定标记：八组结论**全部等于原结论**（集合仅含原结论）→ `"status":"stable"`（稳定）；
+  只要出现不同结论（集合包含多种结论）→ `"status":"sensitive"`（敏感）。
+
+核查写入**独立新表** `robustness_checks`（自包含、不可变），创建后不再重算或改写；
+成功返回 **201** 并进入**独立核查详情**，可凭响应/页面中的**核查编号**随时重新打开。
+
+```json
+{
+  "id": 1, "assessment_id": 12,
+  "assessment": { "id": 12, "tg": 16.36, "td": 14.359183217771522, "delta": 2.000816782228478,
+                  "verdict": "allowed", "formula": { }, },
+  "tolerances": { "tg": 0.01, "ta": 0.01, "rh": 0.5 },
+  "corners": [
+    { "index": 1, "tg_sign": "-", "ta_sign": "-", "rh_sign": "-",
+      "tg": 16.35, "ta": 19.99, "rh": 69.5,
+      "td": 14.238724, "delta": 2.111276, "delta_display": 2.11,
+      "verdict": "allowed", "matches_original": true },
+    { "index": 2, "tg_sign": "-", "ta_sign": "-", "rh_sign": "+",
+      "tg": 16.35, "ta": 19.99, "rh": 70.5,
+      "td": 14.459796, "delta": 1.890204, "delta_display": 1.89,
+      "verdict": "retest", "matches_original": false }
+  ],
+  "verdicts": ["allowed", "retest"], "status": "sensitive", "created_at": "2026-09-14T08:00:00Z"
+}
+```
+
+页面（发起页 `/assessments/:id/robustness-checks/new`、独立核查详情 `/robustness-checks/:id`、
+历史区“凭核查编号重新打开”）**只渲染服务端结果**：展示原评估快照、对称误差范围、八行服务端
+边界结果（翻转行高亮）与稳定/敏感风险提示；**浏览器不生成任何边界组合、不做任何判定或减法**。
+核查详情不存在（404）或读取失败（5xx）时，页面明确告警并保留返回历史区（查找原评估）的入口，
+不会用页面数据冒充服务端结论。
+
+**输入校验（422 逐字段反馈，整次拒绝、不落库、不占用核查编号）：**
+
+| 情形 | 字段 | code |
+| --- | --- | --- |
+| 原评估编号不存在 | `assessment` | `not_found` |
+| 误差幅度缺失/为 null | `tg_eps`/`ta_eps`/`rh_eps` | `required` |
+| 类型不是数值（如字符串、对象） | 同上 | `wrong_type` |
+| 非有限（`NaN`、`±Infinity`、`1e999` 溢出字面量） | 同上 | `not_finite` |
+| 零或负数 | 同上 | `not_positive` |
+| 中心值 ± 幅度越出该量的合法区间 | 同上 | `out_of_range` |
+
+合法区间与评估完全一致：Tg/Ta ∈ [−20, 60] ℃，RH ∈ [1, 100] %。边界**恰好**落在端点上是合法的
+（闭区间，例如中心 20、幅度 40 → 边界恰为 −20 与 60）；越出则 `out_of_range`，反馈中给出中心值
+与实际对称区间。文档形态错误（顶层非对象、未知字段、重复键、对象后多余内容）仍是 **400**，
+与单条提交一致。核查不写入 `assessments`，因此单条/批量录入、前序对照、舱位概览与各端口变量
+完全不受影响。
+
 ### SQLite 迁移
 
 启动时自动建表并做**增量、无损**迁移：旧版数据库（无 `prev_id` 列）启动后通过
 `ALTER TABLE assessments ADD COLUMN prev_id INTEGER` 增加关联字段并补建
 `(voyage, hatch, id DESC)` 索引；历史行 `prev_id` 为 NULL（视作各舱首测），
-历史详情、列表顺序（id 倒序）与新记录创建均保持可用。
+历史详情、列表顺序（id 倒序）与新记录创建均保持可用。稳健性核查使用
+`CREATE TABLE IF NOT EXISTS robustness_checks` **独立新表**承载（原评估快照、误差参数、
+八组角点 JSON、结论集合、稳定/敏感标记），不改动 `assessments` 的任何列；旧库启动时同样
+自动补建该表，历史评估与新的核查能力互不影响。

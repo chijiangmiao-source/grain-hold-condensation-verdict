@@ -44,6 +44,31 @@ async function postBatch(measurements) {
   return { status: res.status, body: text ? JSON.parse(text) : null }
 }
 
+// Robustness-check helpers. The browser supplies ONLY three symmetric error
+// magnitudes; every boundary combination and verdict is computed by Go.
+async function postCheck(assessmentId, tolerances) {
+  const res = await fetch(`${BASE}/api/assessments/${assessmentId}/robustness-checks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: typeof tolerances === 'string' ? tolerances : JSON.stringify(tolerances),
+  })
+  const text = await res.text()
+  return { status: res.status, body: text ? JSON.parse(text) : null }
+}
+async function getCheck(checkId) {
+  const res = await fetch(`${BASE}/api/robustness-checks/${checkId}`)
+  const text = await res.text()
+  return { status: res.status, body: text ? JSON.parse(text) : null }
+}
+
+// Independent band rule used ONLY by this probe to verify the server's
+// per-corner verdicts (closed interval [-2, 2] -> retest).
+function verdictFor(delta) {
+  if (delta > 2) return 'allowed'
+  if (delta < -2) return 'denied'
+  return 'retest'
+}
+
 function magnus(m) {
   const gamma = Math.log(m.rh / 100) + (A * m.ta) / (B + m.ta)
   const td = (B * gamma) / (A - gamma)
@@ -330,6 +355,160 @@ async function main() {
   expect(nonObject.status === 400, 'a non-object row is a 400 format error')
   const afterStruct = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
   expect(afterStruct === afterBatch, 'structural rejections persist nothing')
+
+  // 3e. ROBUSTNESS CHECKS: eight server-evaluated +/- boundary corners.
+  // The probe independently recomputes every corner with its own Magnus
+  // implementation and band rule; a fake/stub API cannot match all eight.
+  const cornerSigns = [
+    ['-', '-', '-'], ['-', '-', '+'], ['-', '+', '-'], ['-', '+', '+'],
+    ['+', '-', '-'], ['+', '-', '+'], ['+', '+', '-'], ['+', '+', '+'],
+  ]
+  const expectedCornersOf = (m, eps, originalVerdict) => cornerSigns.map(([sg, sa, sr], i) => {
+    const c = {
+      ...m,
+      tg: m.tg + (sg === '-' ? -eps.tg : eps.tg),
+      ta: m.ta + (sa === '-' ? -eps.ta : eps.ta),
+      rh: m.rh + (sr === '-' ? -eps.rh : eps.rh),
+    }
+    const { gamma, td, delta } = magnus(c)
+    const verdict = verdictFor(delta)
+    return {
+      index: i + 1, tg_sign: sg, ta_sign: sa, rh_sign: sr,
+      tg: c.tg, ta: c.ta, rh: c.rh,
+      gamma, td, delta,
+      gamma_display: round2(gamma), td_display: round2(td), delta_display: round2(delta),
+      verdict,
+      matches_original: verdict === originalVerdict,
+    }
+  })
+
+  // ---- stable sample far from the boundary ----
+  const stableM = { voyage: 'ACCEPT-ROBUST-S', hatch: '3H', tg: 25, ta: 20, rh: 70 }
+  const stableAssess = await post(stableM)
+  expect(stableAssess.status === 201, 'stable-sample assessment is 201')
+  const stableEps = { tg_eps: 0.5, ta_eps: 0.5, rh_eps: 1 }
+  const stableCheck = await postCheck(stableAssess.body.id, stableEps)
+  expect(stableCheck.status === 201, `stable check is 201 (got ${stableCheck.status})`)
+  expect(stableCheck.body.status === 'stable', 'all corners agreeing -> stable')
+  expect(JSON.stringify(stableCheck.body.verdicts) === JSON.stringify(['allowed']),
+    `verdict set contains only the original verdict, got ${JSON.stringify(stableCheck.body.verdicts)}`)
+  expect(stableCheck.body.assessment_id === stableAssess.body.id, 'check names the origin assessment id')
+  expect(stableCheck.body.corners.length === 8, 'exactly eight boundary corners')
+
+  const stableExpected = expectedCornersOf(stableM, { tg: 0.5, ta: 0.5, rh: 1 }, 'allowed')
+  stableCheck.body.corners.forEach((c, i) => {
+    const e = stableExpected[i]
+    expect(c.tg_sign === e.tg_sign && c.ta_sign === e.ta_sign && c.rh_sign === e.rh_sign,
+      `corner ${i + 1} signs are ${e.tg_sign}${e.ta_sign}${e.rh_sign}`)
+    expect(Math.abs(c.tg - e.tg) < 1e-12 && Math.abs(c.ta - e.ta) < 1e-12 && Math.abs(c.rh - e.rh) < 1e-12,
+      `corner ${i + 1} inputs are centre ${e.tg_sign}${e.ta_sign}${e.rh_sign} epsilon`)
+    expect(Math.abs(c.gamma - e.gamma) < 1e-12, `corner ${i + 1} γ matches independent math`)
+    expect(Math.abs(c.td - e.td) < 1e-12, `corner ${i + 1} Td matches independent math`)
+    expect(Math.abs(c.delta - e.delta) < 1e-12, `corner ${i + 1} unrounded Δ matches independent math`)
+    expect(c.verdict === e.verdict, `corner ${i + 1} verdict ${c.verdict} === independent ${e.verdict}`)
+    expect(c.matches_original === true,
+      `corner ${i + 1} server flag matches_original is true (stable sample)`)
+  })
+  // The frozen original assessment snapshot carries the origin values.
+  expect(stableCheck.body.assessment &&
+    stableCheck.body.assessment.id === stableAssess.body.id &&
+    stableCheck.body.assessment.verdict === 'allowed',
+    'the check embeds an immutable snapshot of the original assessment')
+  expect(stableCheck.body.tolerances &&
+    stableCheck.body.tolerances.tg === 0.5 &&
+    stableCheck.body.tolerances.ta === 0.5 &&
+    stableCheck.body.tolerances.rh === 1,
+    'tolerances are echoed back as tg/ta/rh magnitudes')
+
+  // Refresh/reopen by CHECK NUMBER reproduces the identical frozen record.
+  const stableReload = await getCheck(stableCheck.body.id)
+  expect(stableReload.status === 200, 'a check is reachable by its own number')
+  expect(JSON.stringify(stableReload.body.corners) === JSON.stringify(stableCheck.body.corners),
+    'reload returns the identical eight frozen corners')
+  expect(stableReload.body.status === 'stable' &&
+    JSON.stringify(stableReload.body.verdicts) === JSON.stringify(['allowed']),
+    'reload keeps the stable status and verdict set')
+  expect(stableReload.body.assessment_id === stableAssess.body.id, 'reload keeps the origin id')
+
+  // ---- sensitive sample just inside Δ = 2 ----
+  const sensM = { voyage: 'ACCEPT-ROBUST-X', hatch: '3H', tg: 16.36, ta: 20, rh: 70 }
+  const sensAssess = await post(sensM)
+  expect(sensAssess.body.verdict === 'allowed', `unrounded Δ≈2.0008 -> allowed (got ${sensAssess.body.verdict})`)
+  const sensEps = { tg_eps: 0.01, ta_eps: 0.01, rh_eps: 0.5 }
+  const sensCheck = await postCheck(sensAssess.body.id, sensEps)
+  expect(sensCheck.status === 201 && sensCheck.body.status === 'sensitive',
+    `corners spanning two verdicts -> sensitive (got ${sensCheck.status}/${sensCheck.body?.status})`)
+  expect(JSON.stringify(sensCheck.body.verdicts) === JSON.stringify(['allowed', 'retest']),
+    `verdict set is {allowed, retest} in first-encounter order, got ${JSON.stringify(sensCheck.body.verdicts)}`)
+  const sensExpected = expectedCornersOf(sensM, { tg: 0.01, ta: 0.01, rh: 0.5 }, 'allowed')
+  let flipped = 0
+  sensCheck.body.corners.forEach((c, i) => {
+    const e = sensExpected[i]
+    expect(Math.abs(c.delta - e.delta) < 1e-12 && c.verdict === e.verdict,
+      `sensitive corner ${i + 1} matches independent recomputation`)
+    expect(c.matches_original === e.matches_original,
+      `corner ${i + 1} server matches_original flag matches the probe's own verdict comparison`)
+    if (c.verdict !== 'allowed') flipped += 1
+  })
+  expect(flipped === 4, `exactly four corners flip to retest (got ${flipped})`)
+  // Precisely the four RH+ corners cross the boundary.
+  expect(sensCheck.body.corners.filter((c) => c.rh_sign === '+').every((c) => c.verdict === 'retest'),
+    'the four humid (RH+) corners are the ones that retest')
+
+  // Negative-side sensitivity: Δ≈-2.0022 denied, drier corners retest.
+  const negM = { voyage: 'ACCEPT-ROBUST-N', hatch: '3H', tg: 12.357, ta: 20, rh: 70 }
+  const negAssess = await post(negM)
+  expect(negAssess.body.verdict === 'denied', `unrounded Δ≈-2.0022 -> denied (got ${negAssess.body.verdict})`)
+  const negCheck = await postCheck(negAssess.body.id, sensEps)
+  expect(negCheck.body.status === 'sensitive', 'negative boundary side is sensitive too')
+  expect(JSON.stringify(negCheck.body.verdicts) === JSON.stringify(['retest', 'denied']),
+    `set starts with the first corner's retest then denied, got ${JSON.stringify(negCheck.body.verdicts)}`)
+
+  // ---- illegal tolerances: explicit field feedback, no record ----
+  const beforeChecks = stableCheck.body.id
+  const badChecks = [
+    { body: { tg_eps: 0, ta_eps: 0.5, rh_eps: 1 }, field: 'tg_eps', code: 'not_positive' },
+    { body: { tg_eps: -1, ta_eps: 0.5, rh_eps: 1 }, field: 'tg_eps', code: 'not_positive' },
+    { body: { tg_eps: 40, ta_eps: 0.5, rh_eps: 1 }, field: 'tg_eps', code: 'out_of_range' }, // 25+40 > 60
+    { body: { tg_eps: 0.5, ta_eps: 0.5, rh_eps: 70 }, field: 'rh_eps', code: 'out_of_range' }, // 70-70 < 1
+    { raw: '{"tg_eps":1e999,"ta_eps":0.5,"rh_eps":1}', field: 'tg_eps', code: 'not_finite' },
+    { body: { ta_eps: 0.5, rh_eps: 1 }, field: 'tg_eps', code: 'required' },
+  ]
+  for (const c of badChecks) {
+    const r = c.raw ? await postCheck(stableAssess.body.id, c.raw) : await postCheck(stableAssess.body.id, c.body)
+    expect(r.status === 422, `rejected tolerance -> 422 (${c.field}/${c.code}, got ${r.status})`)
+    const hit = (r.body.fields || []).find((f) => f.field === c.field && f.code === c.code)
+    expect(!!hit, `422 names field ${c.field} with code ${c.code}`)
+  }
+  // A missing ORIGIN assessment is a 422 assessment/not_found field error.
+  const noOrigin = await postCheck(999999, { tg_eps: 0.5, ta_eps: 0.5, rh_eps: 1 })
+  expect(noOrigin.status === 422 && noOrigin.body.fields[0].field === 'assessment' &&
+    noOrigin.body.fields[0].code === 'not_found',
+    'a missing origin assessment gives assessment/not_found field feedback')
+  // A magnitude landing EXACTLY on a legal endpoint is accepted (closed
+  // interval): tg/ta 20 ± 40 spans -20..60 exactly, rh 50 ± 49 spans 1..99.
+  const edgeAssess = await post({ voyage: 'ACCEPT-ROBUST-E', hatch: '3H', tg: 20, ta: 20, rh: 50 })
+  expect(edgeAssess.status === 201, 'edge-case assessment is 201')
+  const edge = await postCheck(edgeAssess.body.id, { tg_eps: 40, ta_eps: 40, rh_eps: 49 })
+  expect(edge.status === 201, `centre 20 ± 40 spans -20..60 exactly -> 201 (got ${edge.status})`)
+  const edgeFirst = edge.body.corners[0]
+  const edgeLast = edge.body.corners[7]
+  expect(edgeFirst.tg === -20 && edgeFirst.ta === -20 && edgeFirst.rh === 1,
+    `the --- corner reaches tg/ta=-20, rh=1, got ${edgeFirst.tg}/${edgeFirst.ta}/${edgeFirst.rh}`)
+  expect(edgeLast.tg === 60 && edgeLast.ta === 60 && edgeLast.rh === 99,
+    `the +++ corner reaches tg/ta=60, rh=99, got ${edgeLast.tg}/${edgeLast.ta}/${edgeLast.rh}`)
+  // Rejected requests consumed no id: the next legal check is exactly one id
+  // after the last accepted one (stable + sensitive + negative + edge = +3).
+  const nextLegal = await postCheck(stableAssess.body.id, { tg_eps: 0.2, ta_eps: 0.2, rh_eps: 0.5 })
+  expect(nextLegal.status === 201 && nextLegal.body.id === beforeChecks + 4,
+    `rejected checks persist no record (next id ${nextLegal.body?.id} expected ${beforeChecks + 4})`)
+  // An unknown check number is a 404.
+  const missingCheck = await getCheck(888888)
+  expect(missingCheck.status === 404, 'an unknown check number is 404')
+  // Checks never appear among assessments or change that list.
+  const robustAssessList = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items
+  expect(robustAssessList.every((i) => i.corners === undefined && i.tolerances === undefined),
+    'robustness data never leaks into assessment list items')
 
   // 4. Denied and retest zones.
   const denied = await post({ voyage: 'ACCEPT-2', hatch: '1P', tg: 5, ta: 28, rh: 95 })

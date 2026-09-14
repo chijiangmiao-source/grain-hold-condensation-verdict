@@ -54,3 +54,25 @@ export async function createBatchAssessments(measurements) {
   })
   return parse(res)
 }
+
+// Robustness check: the browser only supplies three SYMMETRIC instrument
+// error magnitudes for an existing assessment. The server generates the
+// eight +/- boundary combinations, runs each through the existing
+// unrounded dew-point decision, and freezes the results into one immutable
+// check record. The browser never builds a boundary combination or verdict.
+export async function createRobustnessCheck(assessmentId, tolerances) {
+  const res = await fetch(
+    `${BASE}/assessments/${encodeURIComponent(assessmentId)}/robustness-checks`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tolerances),
+    },
+  )
+  return parse(res)
+}
+
+// Read-only: reopen an immutable robustness check by its own check number.
+export function getRobustnessCheck(checkId) {
+  return fetch(`${BASE}/robustness-checks/${encodeURIComponent(checkId)}`).then(parse)
+}

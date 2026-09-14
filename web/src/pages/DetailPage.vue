@@ -68,6 +68,13 @@ watch(() => props.id, (id) => load(id))
       <p class="meta">航次 {{ record.voyage }} · 舱号 {{ record.hatch }} · {{ new Date(record.created_at).toLocaleString() }}</p>
       <p>最终结论：<VerdictBadge :verdict="record.verdict" /></p>
 
+      <p class="robustness-entry" data-test="robustness-entry">
+        海上仪表存在允许误差时，单次露点结论可能在真实值边界上翻转：
+        <RouterLink :to="`/assessments/${record.id}/robustness-checks/new`" class="link">
+          以本评估为中心发起稳健性核查（八组边界 ± 误差）→
+        </RouterLink>
+      </p>
+
       <h3>与同舱前序记录的对照</h3>
       <p v-if="isFirstMeasurement" class="note first-measurement" data-test="first-measurement">
         本次为该航次该舱位的<b>首次测量</b>，尚无同舱前序有效记录可对照；

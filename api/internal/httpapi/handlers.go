@@ -42,6 +42,8 @@ func NewRouter(st *store.Store) *gin.Engine {
 		api.POST("/assessments/batch", createBatchAssessments(st))
 		api.GET("/assessments", listAssessments(st))
 		api.GET("/assessments/:id", getAssessment(st))
+		api.POST("/assessments/:id/robustness-checks", createRobustnessCheck(st))
+		api.GET("/robustness-checks/:id", getRobustnessCheck(st))
 		api.GET("/voyages/:voyage/hatches/latest", latestHatches(st))
 	}
 	return r

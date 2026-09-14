@@ -92,6 +92,26 @@ CREATE TABLE IF NOT EXISTS assessments (
 );
 CREATE INDEX IF NOT EXISTS idx_assessments_created_at ON assessments(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_assessments_chain ON assessments(voyage, hatch, id DESC);
+
+-- Robustness checks live in their OWN table: assessments is untouched, so
+-- single/batch entry, predecessor linking and the voyage overview stay
+-- exactly as before. Every row is immutable once inserted: the original
+-- assessment snapshot, error parameters, the eight boundary results and the
+-- distinct-verdict set are frozen at creation time (a check is never
+-- recomputed or rewritten afterwards).
+CREATE TABLE IF NOT EXISTS robustness_checks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    assessment_id INTEGER NOT NULL,          -- the original assessment id
+    assessment    TEXT    NOT NULL,          -- immutable original DTO snapshot (JSON)
+    tg_eps        REAL    NOT NULL,          -- symmetric Tg tolerance, °C
+    ta_eps        REAL    NOT NULL,          -- symmetric Ta tolerance, °C
+    rh_eps        REAL    NOT NULL,          -- symmetric RH tolerance, %
+    corners       TEXT    NOT NULL,          -- the 8 boundary results, in order (JSON)
+    verdicts      TEXT    NOT NULL,          -- distinct verdict set of the 8 corners (JSON)
+    status        TEXT    NOT NULL,          -- stable | sensitive
+    created_at    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_robustness_assessment ON robustness_checks(assessment_id);
 `); err != nil {
 		return err
 	}

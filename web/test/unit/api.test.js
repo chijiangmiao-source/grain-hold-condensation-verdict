@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createAssessment,
   createBatchAssessments,
+  createRobustnessCheck,
   getAssessment,
+  getRobustnessCheck,
   getVoyageOverview,
   listAssessments,
 } from '@/lib/api.js'
@@ -118,5 +120,51 @@ describe('api client', () => {
     expect(res.status).toBe(422)
     expect(res.data.rows[0].row).toBe(2)
     expect(res.data.rows[0].fields[0].field).toBe('tg')
+  })
+
+  it('posts only the three symmetric tolerances to the check endpoint and is routed by assessment id', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ id: 3, status: 'stable', corners: [], verdicts: ['allowed'] }), {
+        status: 201, headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+
+    const res = await createRobustnessCheck(42, { tg_eps: 0.5, ta_eps: 0.5, rh_eps: 1 })
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(
+      /\/api\/assessments\/42\/robustness-checks$/)
+    const [, init] = fetchMock.mock.calls[0]
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({ tg_eps: 0.5, ta_eps: 0.5, rh_eps: 1 })
+    expect(res.status).toBe(201)
+    expect(res.data.id).toBe(3)
+  })
+
+  it('surfaces the 422 field feedback of a rejected check without throwing', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        error: '稳健性核查输入校验失败，未生成任何记录',
+        fields: [{ field: 'rh_eps', code: 'out_of_range', message: '越界' }],
+      }), { status: 422, headers: { 'Content-Type': 'application/json' } }),
+    )
+
+    const res = await createRobustnessCheck(1, { tg_eps: 0.5, ta_eps: 0.5, rh_eps: 999 })
+    expect(res.ok).toBe(false)
+    expect(res.status).toBe(422)
+    expect(res.data.fields[0].field).toBe('rh_eps')
+  })
+
+  it('builds the independent check-detail url by check id and renders server data', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        id: 9, assessment_id: 4, status: 'sensitive',
+        verdicts: ['allowed', 'retest'], corners: [{ index: 1 }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    )
+
+    const res = await getRobustnessCheck('9')
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/api\/robustness-checks\/9$/)
+    expect(res.status).toBe(200)
+    expect(res.data.assessment_id).toBe(4)
+    expect(res.data.verdictSet || res.data.verdicts).toEqual(['allowed', 'retest'])
   })
 })

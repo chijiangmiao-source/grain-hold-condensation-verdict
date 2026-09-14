@@ -1,8 +1,10 @@
 <script setup>
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
-import { RouterLink } from 'vue-router'
+import { RouterLink, useRouter } from 'vue-router'
 import { createAssessment, createBatchAssessments, listAssessments } from '@/lib/api.js'
 import VerdictBadge from '@/components/VerdictBadge.vue'
+
+const router = useRouter()
 
 // Constraints mirror decision.Validate on the server. Client-side limits
 // give instant feedback; the server remains the authority and its 422
@@ -311,6 +313,16 @@ const voyages = computed(() => {
 })
 
 onMounted(refreshList)
+
+// Reopen an immutable robustness check by its own check number. The check
+// detail is read-only and renders only server values; the browser builds no
+// boundary combinations and no verdict.
+const checkIdInput = ref('')
+function openCheck() {
+  const id = String(checkIdInput.value).trim()
+  if (!/^\d+$/.test(id)) return
+  router?.push(`/robustness-checks/${id}`)
+}
 </script>
 
 <template>
@@ -542,6 +554,20 @@ onMounted(refreshList)
 
       <div class="card history">
         <h2>历史记录</h2>
+
+        <form class="reopen-check" novalidate data-test="reopen-check" @submit.prevent="openCheck">
+          <label for="check-id-input">凭核查编号重新打开稳健性核查：</label>
+          <input
+            id="check-id-input"
+            v-model="checkIdInput"
+            type="number"
+            min="1"
+            step="1"
+            placeholder="核查编号"
+          />
+          <button type="submit" class="btn-secondary" data-test="reopen-check-btn">打开核查</button>
+        </form>
+
         <p v-if="items.length === 0" class="note">暂无记录。</p>
         <template v-else>
           <div class="voyage-entries" data-test="voyage-entries">
