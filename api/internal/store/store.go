@@ -37,6 +37,19 @@ type Store struct {
 // ErrNoRows is returned by Get for unknown ids.
 var ErrNoRows = sql.ErrNoRows
 
+// MaxBatchRows is the largest number of measurements one batch submission may
+// carry. The HTTP layer rejects bigger batches as malformed requests.
+const MaxBatchRows = 20
+
+// BatchRow is one already-validated, already-evaluated measurement of a
+// batch. Validation and the Magnus evaluation happen before the batch
+// transaction opens, so a rejected row can never be inserted nor become
+// another row's predecessor.
+type BatchRow struct {
+	Input  decision.Input
+	Result decision.Result
+}
+
 // Open opens (creating if needed) the database at path and applies the
 // schema. Use ":memory:" for tests.
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -141,23 +154,80 @@ func (s *Store) Create(ctx context.Context, in decision.Input, r decision.Result
 // creation timestamp (or carry a skewed one), proving the "latest per hatch"
 // query chooses by record id rather than by the timestamp text.
 func (s *Store) createAt(ctx context.Context, in decision.Input, r decision.Result, now time.Time) (*Assessment, error) {
-	createdAt := now.Format(time.RFC3339Nano)
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
+	a, err := insertAssessmentTx(ctx, tx, in, r, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit assessment: %w", err)
+	}
+	return a, nil
+}
+
+// CreateBatch inserts the already-validated, already-evaluated measurements
+// in the given order inside ONE transaction. For every row the most recent
+// earlier row for the same voyage and hatch is fixed as its predecessor.
+//
+// The predecessor SELECT runs on the same transaction/connection as the
+// inserts, so it reads this transaction's own earlier writes: a later batch
+// row for a voyage+hatch seen earlier in the SAME batch chains to that earlier
+// batch row, while a hatch absent from the batch chains to the latest
+// committed row in the database. A voyage+hatch present in neither gets no
+// predecessor (its first measurement).
+//
+// The whole batch is atomic: any failure rolls the transaction back, leaving
+// neither partial rows nor a predecessor that points at a half-saved batch.
+// MaxBatchRows is enforced by the HTTP layer before this is reached.
+func (s *Store) CreateBatch(ctx context.Context, rows []BatchRow) ([]*Assessment, error) {
+	return s.createBatchAt(ctx, rows, time.Now().UTC())
+}
+
+// createBatchAt is the clock-injectable core of CreateBatch. Every row of a
+// batch shares one timestamp; record id (creation order), never created_at,
+// orders predecessor chains and the per-hatch latest overview.
+func (s *Store) createBatchAt(ctx context.Context, rows []BatchRow, now time.Time) ([]*Assessment, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+
+	out := make([]*Assessment, 0, len(rows))
+	for _, row := range rows {
+		a, err := insertAssessmentTx(ctx, tx, row.Input, row.Result, now)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit batch: %w", err)
+	}
+	return out, nil
+}
+
+// insertAssessmentTx locks and writes one assessment inside the caller's
+// transaction and returns it with its fixed predecessor. Shared by the
+// single-row Create path and the ordered CreateBatch loop so the predecessor
+// query and the INSERT cannot drift between the two.
+func insertAssessmentTx(ctx context.Context, tx *sql.Tx, in decision.Input, r decision.Result, now time.Time) (*Assessment, error) {
 	var prev sql.NullInt64
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 SELECT id FROM assessments
 WHERE voyage = ? AND hatch = ?
 ORDER BY id DESC
 LIMIT 1`, in.Voyage, in.Hatch).Scan(&prev)
 	switch {
 	case err == sql.ErrNoRows:
-		// First measurement for this voyage+hatch: no predecessor.
+		// First measurement for this voyage+hatch (in this transaction and in
+		// the committed database): no predecessor.
 	case err != nil:
 		return nil, fmt.Errorf("lock predecessor: %w", err)
 	}
@@ -166,16 +236,13 @@ LIMIT 1`, in.Voyage, in.Hatch).Scan(&prev)
 INSERT INTO assessments (voyage, hatch, tg, ta, rh, gamma, td, delta, verdict, created_at, prev_id)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		in.Voyage, in.Hatch, in.Tg, in.Ta, in.RH,
-		r.Gamma, r.Td, r.Delta, r.Verdict, createdAt, prev)
+		r.Gamma, r.Td, r.Delta, r.Verdict, now.Format(time.RFC3339Nano), prev)
 	if err != nil {
 		return nil, fmt.Errorf("insert assessment: %w", err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit assessment: %w", err)
 	}
 
 	a := &Assessment{ID: id, Input: in, Result: r, CreatedAt: now}

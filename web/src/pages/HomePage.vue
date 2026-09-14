@@ -1,7 +1,7 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import { createAssessment, listAssessments } from '@/lib/api.js'
+import { createAssessment, createBatchAssessments, listAssessments } from '@/lib/api.js'
 import VerdictBadge from '@/components/VerdictBadge.vue'
 
 // Constraints mirror decision.Validate on the server. Client-side limits
@@ -15,15 +15,65 @@ const FIELDS = [
   { key: 'rh', label: '相对湿度 RH（%）', type: 'number', min: 1, max: 100, step: '0.1', placeholder: '1.0 ~ 100.0' },
 ]
 
+// The batch endpoint caps one submission at twenty ordered measurements; the
+// constant mirrors store.MaxBatchRows on the server.
+const MAX_BATCH_ROWS = 20
+const MODE_SINGLE = 'single'
+const MODE_BATCH = 'batch'
+
+const mode = ref(MODE_SINGLE)
+
+// ---- single-row mode (unchanged behaviour) ----
 const form = reactive({ voyage: '', hatch: '', tg: '', ta: '', rh: '' })
 const errors = reactive({})
 const submitError = ref('')
 const submitting = ref(false)
 const latest = ref(null)
-const items = ref([])
+
+// ---- batch mode ----
+function emptyBatchRow(prev = null) {
+  // A new line inherits the previous line's voyage/hatch: consecutive
+  // multi-hatch transcription usually keeps the voyage, and repeating a hatch
+  // is a normal repeat measurement. The measured temperatures never copy.
+  return { voyage: prev?.voyage ?? '', hatch: prev?.hatch ?? '', tg: '', ta: '', rh: '' }
+}
+const batchRows = ref([emptyBatchRow()])
+// Row-level failures mirror the server 422 envelope:
+// [{ row: 1-based, fields: [{ field, code, message }] }].
+const batchRowErrors = ref([])
+const batchSubmitError = ref('')
+const batchSending = ref(false)
+const batchResult = ref(null) // { count, items } on 201
 
 function errFor(key) {
   return errors[key]?.message || ''
+}
+
+function batchFieldError(index, key) {
+  const re = batchRowErrors.value.find((r) => r.row === index + 1)
+  return re?.fields.find((f) => f.field === key) || null
+}
+function batchRowInvalid(index) {
+  return batchRowErrors.value.some((r) => r.row === index + 1)
+}
+const batchProblemRows = computed(() => batchRowErrors.value.map((r) => r.row))
+
+function addBatchRow() {
+  if (batchRows.value.length >= MAX_BATCH_ROWS) return
+  batchRows.value.push(emptyBatchRow(batchRows.value[batchRows.value.length - 1]))
+}
+function removeBatchRow(index) {
+  if (batchRows.value.length <= 1) return
+  batchRows.value.splice(index, 1)
+}
+
+// Scroll the first offending line into view so the chief officer can fix it
+// without hunting through twenty rows.
+async function locateFirstBatchError() {
+  await nextTick()
+  const el = document.querySelector('[data-test="batch-row"].batch-row-invalid')
+  el?.scrollIntoView?.({ behavior: 'smooth', block: 'center' })
+  el?.querySelector('input')?.focus?.()
 }
 
 // Instant client-side checks; a rejected value is never sent.
@@ -46,6 +96,33 @@ function validateLocally() {
   checkNum('rh', '相对湿度 RH', 1, 100)
 
   return Object.keys(errors).length === 0
+}
+
+// Per-row client checks build the SAME row/fields shape as the server 422, so
+// a client-blocked batch and a server-rejected batch render identically.
+function validateBatchLocally() {
+  const rowErrs = []
+  batchRows.value.forEach((row, i) => {
+    const fields = []
+    if (!row.voyage.trim()) fields.push({ field: 'voyage', code: 'client', message: '航次代号不能为空' })
+    if (!row.hatch.trim()) fields.push({ field: 'hatch', code: 'client', message: '舱号不能为空' })
+
+    const checkNum = (key, label, lo, hi) => {
+      const raw = String(row[key]).trim()
+      if (raw === '') { fields.push({ field: key, code: 'client', message: `${label}必须填写` }); return }
+      const v = Number(raw)
+      if (!Number.isFinite(v)) { fields.push({ field: key, code: 'client', message: `${label}必须为有限数值` }); return }
+      if (v < lo || v > hi) {
+        fields.push({ field: key, code: 'client', message: `${label}必须在 ${lo.toFixed(1)} 至 ${hi.toFixed(1)} 之间` })
+      }
+    }
+    checkNum('tg', '粮温 Tg', -20, 60)
+    checkNum('ta', '舱内气温 Ta', -20, 60)
+    checkNum('rh', '相对湿度 RH', 1, 100)
+
+    if (fields.length > 0) rowErrs.push({ row: i + 1, fields })
+  })
+  return rowErrs
 }
 
 async function refreshList() {
@@ -91,11 +168,61 @@ async function submit() {
   }
 }
 
+async function submitBatch() {
+  batchSubmitError.value = ''
+  batchResult.value = null
+  batchRowErrors.value = []
+
+  // Instant local rejection keeps an obviously bad line from leaving the
+  // browser; the server still independently rejects a bad whole batch.
+  const localErrs = validateBatchLocally()
+  if (localErrs.length > 0) {
+    batchRowErrors.value = localErrs
+    batchSubmitError.value = `第 ${batchProblemRows.value.join('、')} 行未通过校验，整批尚未提交`
+    await locateFirstBatchError()
+    return
+  }
+
+  // Every line is sent in measurement order. The browser never computes
+  // gamma/Td/delta/verdict: it only renders what the batch response returns.
+  const payload = batchRows.value.map((r) => ({
+    voyage: r.voyage.trim(),
+    hatch: r.hatch.trim(),
+    tg: Number(r.tg),
+    ta: Number(r.ta),
+    rh: Number(r.rh),
+  }))
+
+  batchSending.value = true
+  try {
+    const res = await createBatchAssessments(payload)
+    if (res.status === 422) {
+      // Whole-batch rejection: keep ALL inputs, mark each row named by the
+      // server with its original field errors, and jump to the first one.
+      batchRowErrors.value = Array.isArray(res.data?.rows) ? res.data.rows : []
+      batchSubmitError.value = res.data?.error || '批量输入校验失败，整批未保存'
+      await locateFirstBatchError()
+      return
+    }
+    if (!res.ok) {
+      batchSubmitError.value = res.data?.error || `请求失败（${res.status}）`
+      return
+    }
+    batchResult.value = res.data
+    await refreshList()
+  } catch (e) {
+    batchSubmitError.value = '无法连接 API：' + e.message
+  } finally {
+    batchSending.value = false
+  }
+}
+
 const fmt2 = (v) => (v === null || v === undefined ? '—' : Number(v).toFixed(2))
 
 // Distinct voyage codes for the overview entry points. This is only a
 // navigation index built from the list; which record is "latest" per hatch is
 // decided entirely by the server overview endpoint, never here.
+const items = ref([])
 const voyages = computed(() => {
   const seen = new Set()
   const out = []
@@ -112,50 +239,226 @@ onMounted(refreshList)
 </script>
 
 <template>
-  <section class="grid">
-    <form class="card form" novalidate @submit.prevent="submit">
-      <h2>录入测量数据</h2>
-      <p class="note">温差风险取决于粮温与舱内空气<b>露点</b>之差，而非相对湿度本身。提交后由 Go API 统一复算。</p>
-
-      <div v-for="f in FIELDS" :key="f.key" class="field" :class="{ invalid: !!errors[f.key] }">
-        <label :for="'f-' + f.key">{{ f.label }}</label>
-        <input
-          :id="'f-' + f.key"
-          v-model="form[f.key]"
-          :type="f.type"
-          :min="f.min"
-          :max="f.max"
-          :step="f.step"
-          :placeholder="f.placeholder"
-          :aria-invalid="!!errors[f.key]"
-          :aria-describedby="errors[f.key] ? 'err-' + f.key : null"
-        />
-        <p v-if="errFor(f.key)" :id="'err-' + f.key" class="field-err">{{ errFor(f.key) }}</p>
+  <section class="grid" :class="{ 'grid--wide': mode === MODE_BATCH }">
+    <div class="card form">
+      <div class="mode-tabs" data-test="mode-tabs">
+        <a
+          href="#"
+          class="mode-tab"
+          :class="{ active: mode === MODE_SINGLE }"
+          data-test="mode-single"
+          @click.prevent="mode = MODE_SINGLE"
+        >单条录入</a>
+        <a
+          href="#"
+          class="mode-tab"
+          :class="{ active: mode === MODE_BATCH }"
+          data-test="mode-batch"
+          @click.prevent="mode = MODE_BATCH"
+        >批量录入（最多 20 行）</a>
       </div>
 
-      <p v-if="submitError" class="banner-error">{{ submitError }}</p>
+      <!-- ============ single-row form ============ -->
+      <form v-if="mode === MODE_SINGLE" class="single-form" novalidate @submit.prevent="submit">
+        <h2>录入测量数据</h2>
+        <p class="note">温差风险取决于粮温与舱内空气<b>露点</b>之差，而非相对湿度本身。提交后由 Go API 统一复算。</p>
 
-      <button type="submit" :disabled="submitting">
-        {{ submitting ? '复算中…' : '提交复算' }}
-      </button>
-    </form>
+        <div v-for="f in FIELDS" :key="f.key" class="field" :class="{ invalid: !!errors[f.key] }">
+          <label :for="'f-' + f.key">{{ f.label }}</label>
+          <input
+            :id="'f-' + f.key"
+            v-model="form[f.key]"
+            :type="f.type"
+            :min="f.min"
+            :max="f.max"
+            :step="f.step"
+            :placeholder="f.placeholder"
+            :aria-invalid="!!errors[f.key]"
+            :aria-describedby="errors[f.key] ? 'err-' + f.key : null"
+          />
+          <p v-if="errFor(f.key)" :id="'err-' + f.key" class="field-err">{{ errFor(f.key) }}</p>
+        </div>
+
+        <p v-if="submitError" class="banner-error">{{ submitError }}</p>
+
+        <button type="submit" :disabled="submitting">
+          {{ submitting ? '复算中…' : '提交复算' }}
+        </button>
+      </form>
+
+      <!-- ============ batch form ============ -->
+      <form v-else class="batch-form" novalidate @submit.prevent="submitBatch">
+        <h2>批量录入测量数据</h2>
+        <p class="note">靠港前集中抄录时，按<b>测量先后</b>逐行填写航次、舱号、粮温、气温与湿度，一次提交。
+          同航次同舱的后一行会关联本批较早记录；任一行非法则<b>整批不落库</b>，已填内容全部保留并定位到问题行。</p>
+
+        <div class="batch-scroll">
+          <div class="batch-grid" data-test="batch-grid">
+            <div class="batch-head batch-row">
+              <span>#</span>
+              <span>航次代号</span>
+              <span>舱号</span>
+              <span>粮温 Tg（℃）</span>
+              <span>气温 Ta（℃）</span>
+              <span>湿度 RH（%）</span>
+              <span></span>
+            </div>
+
+            <div
+              v-for="(row, i) in batchRows"
+              :key="i"
+              class="batch-row"
+              :class="{ 'batch-row-invalid': batchRowInvalid(i) }"
+              :data-row="i + 1"
+              data-test="batch-row"
+            >
+              <span class="batch-index">{{ i + 1 }}</span>
+              <div class="batch-cell">
+                <input
+                  :id="`bf-${i}-voyage`"
+                  v-model="row.voyage"
+                  type="text"
+                  placeholder="如 V-2026-09"
+                  :aria-invalid="!!batchFieldError(i, 'voyage')"
+                />
+                <p v-if="batchFieldError(i, 'voyage')" :id="`berr-${i}-voyage`" class="cell-err">
+                  {{ batchFieldError(i, 'voyage').message }}
+                </p>
+              </div>
+              <div class="batch-cell">
+                <input
+                  :id="`bf-${i}-hatch`"
+                  v-model="row.hatch"
+                  type="text"
+                  placeholder="如 3H"
+                  :aria-invalid="!!batchFieldError(i, 'hatch')"
+                />
+                <p v-if="batchFieldError(i, 'hatch')" :id="`berr-${i}-hatch`" class="cell-err">
+                  {{ batchFieldError(i, 'hatch').message }}
+                </p>
+              </div>
+              <div class="batch-cell">
+                <input
+                  :id="`bf-${i}-tg`"
+                  v-model="row.tg"
+                  type="number"
+                  min="-20"
+                  max="60"
+                  step="0.1"
+                  placeholder="-20~60"
+                  :aria-invalid="!!batchFieldError(i, 'tg')"
+                />
+                <p v-if="batchFieldError(i, 'tg')" :id="`berr-${i}-tg`" class="cell-err">
+                  {{ batchFieldError(i, 'tg').message }}
+                </p>
+              </div>
+              <div class="batch-cell">
+                <input
+                  :id="`bf-${i}-ta`"
+                  v-model="row.ta"
+                  type="number"
+                  min="-20"
+                  max="60"
+                  step="0.1"
+                  placeholder="-20~60"
+                  :aria-invalid="!!batchFieldError(i, 'ta')"
+                />
+                <p v-if="batchFieldError(i, 'ta')" :id="`berr-${i}-ta`" class="cell-err">
+                  {{ batchFieldError(i, 'ta').message }}
+                </p>
+              </div>
+              <div class="batch-cell">
+                <input
+                  :id="`bf-${i}-rh`"
+                  v-model="row.rh"
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="0.1"
+                  placeholder="1~100"
+                  :aria-invalid="!!batchFieldError(i, 'rh')"
+                />
+                <p v-if="batchFieldError(i, 'rh')" :id="`berr-${i}-rh`" class="cell-err">
+                  {{ batchFieldError(i, 'rh').message }}
+                </p>
+              </div>
+              <div class="batch-cell batch-del">
+                <button
+                  type="button"
+                  class="btn-mini"
+                  data-test="batch-remove-row"
+                  :disabled="batchRows.length <= 1"
+                  :aria-label="`删除第 ${i + 1} 行`"
+                  @click="removeBatchRow(i)"
+                >✕</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="batch-actions">
+          <button
+            type="button"
+            class="btn-secondary"
+            data-test="batch-add-row"
+            :disabled="batchRows.length >= MAX_BATCH_ROWS"
+            @click="addBatchRow"
+          >＋ 添加一行（{{ batchRows.length }}/{{ MAX_BATCH_ROWS }}）</button>
+          <button type="submit" class="btn-primary" :disabled="batchSending">
+            {{ batchSending ? '批量复算中…' : `一次提交 ${batchRows.length} 行` }}
+          </button>
+        </div>
+
+        <p v-if="batchSubmitError" class="banner-error" data-test="batch-banner">{{ batchSubmitError }}</p>
+      </form>
+    </div>
 
     <div class="side">
-      <div v-if="latest" class="card result">
-        <h2>判定结果 <VerdictBadge :verdict="latest.verdict" :hint="false" /></h2>
-        <dl>
-          <div><dt>γ（未舍入）</dt><dd>{{ latest.gamma }}</dd></div>
-          <div><dt>γ（展示）</dt><dd>{{ fmt2(latest.gamma_display) }}</dd></div>
-          <div><dt>露点 Td（℃）</dt><dd>{{ fmt2(latest.td_display) }}</dd></div>
-          <div><dt>Δ = Tg − Td（℃，未舍入）</dt><dd>{{ latest.delta }}</dd></div>
-          <div><dt>Δ（展示，℃）</dt><dd class="strong">{{ fmt2(latest.delta_display) }}</dd></div>
-        </dl>
-        <RouterLink :to="`/assessments/${latest.id}`" class="link">查看公式代入明细 →</RouterLink>
-      </div>
-      <div v-else class="card placeholder">
-        <h2>判定结果</h2>
-        <p>提交一次合法测量后在此显示。Δ&gt;2.00 允许，Δ&lt;−2.00 禁止，闭区间 [−2.00, 2.00] 复测。</p>
-      </div>
+      <!-- single-row result -->
+      <template v-if="mode === MODE_SINGLE">
+        <div v-if="latest" class="card result">
+          <h2>判定结果 <VerdictBadge :verdict="latest.verdict" :hint="false" /></h2>
+          <dl>
+            <div><dt>γ（未舍入）</dt><dd>{{ latest.gamma }}</dd></div>
+            <div><dt>γ（展示）</dt><dd>{{ fmt2(latest.gamma_display) }}</dd></div>
+            <div><dt>露点 Td（℃）</dt><dd>{{ fmt2(latest.td_display) }}</dd></div>
+            <div><dt>Δ = Tg − Td（℃，未舍入）</dt><dd>{{ latest.delta }}</dd></div>
+            <div><dt>Δ（展示，℃）</dt><dd class="strong">{{ fmt2(latest.delta_display) }}</dd></div>
+          </dl>
+          <RouterLink :to="`/assessments/${latest.id}`" class="link">查看公式代入明细 →</RouterLink>
+        </div>
+        <div v-else class="card placeholder">
+          <h2>判定结果</h2>
+          <p>提交一次合法测量后在此显示。Δ&gt;2.00 允许，Δ&lt;−2.00 禁止，闭区间 [−2.00, 2.00] 复测。</p>
+        </div>
+      </template>
+
+      <!-- batch result: one row per saved measurement, in order -->
+      <template v-else>
+        <div v-if="batchResult" class="card batch-result" data-test="batch-result">
+          <h2>批量判定结果 <span class="meta">已保存 {{ batchResult.count }} 行</span></h2>
+          <table>
+            <thead>
+              <tr><th>行</th><th>评估编号</th><th>航次/舱号</th><th>Δ（未舍入）</th><th>Δ（展示）</th><th>结论</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(a, i) in batchResult.items" :key="a.id" data-test="batch-result-row">
+                <td>{{ i + 1 }}</td>
+                <td><RouterLink :to="`/assessments/${a.id}`" class="link">#{{ a.id }}</RouterLink></td>
+                <td>{{ a.voyage }} / {{ a.hatch }}</td>
+                <td>{{ a.delta }}</td>
+                <td class="strong">{{ fmt2(a.delta_display) }}</td>
+                <td><VerdictBadge :verdict="a.verdict" :hint="false" /></td>
+                <td><RouterLink :to="`/assessments/${a.id}`" class="link">详情 →</RouterLink></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else class="card placeholder">
+          <h2>批量判定结果</h2>
+          <p>整批提交成功后，在此按行显示评估编号、未舍入温差、展示温差与结论，编号可直接进入既有详情页。</p>
+        </div>
+      </template>
 
       <div class="card history">
         <h2>历史记录</h2>

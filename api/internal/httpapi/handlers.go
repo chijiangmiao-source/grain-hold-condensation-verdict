@@ -39,6 +39,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 	{
 		api.GET("/healthz", healthz)
 		api.POST("/assessments", createAssessment(st))
+		api.POST("/assessments/batch", createBatchAssessments(st))
 		api.GET("/assessments", listAssessments(st))
 		api.GET("/assessments/:id", getAssessment(st))
 		api.GET("/voyages/:voyage/hatches/latest", latestHatches(st))
@@ -52,108 +53,18 @@ func healthz(c *gin.Context) {
 
 func createAssessment(st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if c.Request.Body == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "请求体为空，必须提交 JSON 对象"})
+		raw, ok := readObjectBody(c)
+		if !ok {
 			return
 		}
-		body, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求体失败: " + err.Error()})
-			return
-		}
-		// Structural validation before any field is parsed: the document must
-		// be exactly one JSON object, with no trailing bytes and no repeated
-		// keys. This closes two holes of decoding straight into a map:
-		// Decoder.More() mistakes a stray ']' for an end-array token and lets
-		// trailing junk pass, while map unmarshalling silently keeps the last
-		// value of a repeated key. A top-level null (or any other non-object)
-		// is a malformed request body here, not five "field required" errors.
-		if err := validateJSONObjectBody(body); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		if field, bad := unknownField(raw, assessmentFields); bad {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "出现未知字段: " + field})
 			return
 		}
 
-		// Decode into raw messages so a bad value in one field does not
-		// abort the others: every offending field is reported in one 422.
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(body, &raw); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   "请求体不是合法的 JSON",
-				"details": err.Error(),
-			})
-			return
-		}
-
-		allowed := map[string]bool{"voyage": true, "hatch": true, "tg": true, "ta": true, "rh": true}
-		for k := range raw {
-			if !allowed[k] {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "出现未知字段: " + k})
-				return
-			}
-		}
-
-		var in decision.Input
-		var bad []decision.FieldError
-
-		parseString := func(field string, dst *string, label string) {
-			b, ok := raw[field]
-			if !ok || string(b) == "null" {
-				bad = append(bad, decision.FieldError{Field: field, Code: "required", Message: label + "必须填写"})
-				return
-			}
-			var s string
-			if err := json.Unmarshal(b, &s); err != nil {
-				bad = append(bad, decision.FieldError{Field: field, Code: "wrong_type", Message: label + "必须是字符串"})
-				return
-			}
-			*dst = strings.TrimSpace(s)
-		}
-		parseNumber := func(field string, dst *float64, label string) {
-			b, ok := raw[field]
-			if !ok || string(b) == "null" {
-				bad = append(bad, decision.FieldError{Field: field, Code: "required", Message: label + "必须填写"})
-				return
-			}
-			var v float64
-			if err := json.Unmarshal(b, &v); err != nil {
-				// A JSON number that fails to decode (e.g. 1e999 -> +Inf)
-				// is non-finite; any other JSON value is the wrong type.
-				var ute *json.UnmarshalTypeError
-				if errors.As(err, &ute) && strings.HasPrefix(ute.Value, "number") {
-					bad = append(bad, decision.FieldError{Field: field, Code: "not_finite", Message: label + "必须为有限数值"})
-				} else {
-					bad = append(bad, decision.FieldError{Field: field, Code: "wrong_type", Message: label + "必须是数值"})
-				}
-				return
-			}
-			*dst = v
-		}
-
-		parseString("voyage", &in.Voyage, "航次代号")
-		parseString("hatch", &in.Hatch, "舱号")
-		parseNumber("tg", &in.Tg, "粮温 Tg")
-		parseNumber("ta", &in.Ta, "舱内气温 Ta")
-		parseNumber("rh", &in.RH, "相对湿度 RH")
-
-		// Range checks (and empty-string checks) live in decision.Validate so
-		// the rules cannot diverge from the math package. Missing fields keep
-		// their zero value, which may spuriously fail a range check too, so
-		// the response reports exactly one error per field.
-		res, err := decision.Evaluate(in)
-		var verr *decision.ValidationError
-		if errors.As(err, &verr) {
-			seen := map[string]bool{}
-			for _, f := range bad {
-				seen[f.Field] = true
-			}
-			for _, f := range verr.Fields {
-				if !seen[f.Field] {
-					bad = append(bad, f)
-					seen[f.Field] = true
-				}
-			}
-		} else if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		in, res, bad, evalErr := parseAssessmentFields(raw)
+		if evalErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": evalErr.Error()})
 			return
 		}
 		if len(bad) > 0 {
@@ -170,6 +81,260 @@ func createAssessment(st *store.Store) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusCreated, toDTO(a))
+	}
+}
+
+// assessmentFields is the only set of keys a measurement object may carry.
+// Both the single and the batch endpoint enforce it.
+var assessmentFields = map[string]bool{
+	"voyage": true, "hatch": true, "tg": true, "ta": true, "rh": true,
+}
+
+// readObjectBody reads the request body and structurally verifies it is
+// exactly one JSON object (no trailing bytes, no repeated keys), returning
+// its raw per-field messages. Every malformed-document case answers 400 here;
+// value-level errors stay the later 422 path.
+func readObjectBody(c *gin.Context) (map[string]json.RawMessage, bool) {
+	if c.Request.Body == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体为空，必须提交 JSON 对象"})
+		return nil, false
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求体失败: " + err.Error()})
+		return nil, false
+	}
+	if err := validateJSONObjectBody(body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return nil, false
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "请求体不是合法的 JSON",
+			"details": err.Error(),
+		})
+		return nil, false
+	}
+	return raw, true
+}
+
+// unknownField reports the first key outside the allowed set, if any.
+func unknownField(raw map[string]json.RawMessage, allowed map[string]bool) (string, bool) {
+	for k := range raw {
+		if !allowed[k] {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+// parseAssessmentFields decodes the five known fields of one measurement
+// object and merges decision.Evaluate's range/emptiness validation,
+// reproducing exactly the single-submission 422 semantics: a bad value in one
+// field never aborts the others, and every offending field is reported at
+// most once (a missing/wrong-typed field keeps its parse error instead of a
+// duplicate range error from the zero value). On success the evaluated result
+// is returned too. The single and batch endpoints share this, so the two
+// paths cannot validate the same row differently.
+func parseAssessmentFields(raw map[string]json.RawMessage) (decision.Input, *decision.Result, []decision.FieldError, error) {
+	var in decision.Input
+	var bad []decision.FieldError
+
+	parseString := func(field string, dst *string, label string) {
+		b, ok := raw[field]
+		if !ok || string(b) == "null" {
+			bad = append(bad, decision.FieldError{Field: field, Code: "required", Message: label + "必须填写"})
+			return
+		}
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			bad = append(bad, decision.FieldError{Field: field, Code: "wrong_type", Message: label + "必须是字符串"})
+			return
+		}
+		*dst = strings.TrimSpace(s)
+	}
+	parseNumber := func(field string, dst *float64, label string) {
+		b, ok := raw[field]
+		if !ok || string(b) == "null" {
+			bad = append(bad, decision.FieldError{Field: field, Code: "required", Message: label + "必须填写"})
+			return
+		}
+		var v float64
+		if err := json.Unmarshal(b, &v); err != nil {
+			// A JSON number that fails to decode (e.g. 1e999 -> +Inf)
+			// is non-finite; any other JSON value is the wrong type.
+			var ute *json.UnmarshalTypeError
+			if errors.As(err, &ute) && strings.HasPrefix(ute.Value, "number") {
+				bad = append(bad, decision.FieldError{Field: field, Code: "not_finite", Message: label + "必须为有限数值"})
+			} else {
+				bad = append(bad, decision.FieldError{Field: field, Code: "wrong_type", Message: label + "必须是数值"})
+			}
+			return
+		}
+		*dst = v
+	}
+
+	parseString("voyage", &in.Voyage, "航次代号")
+	parseString("hatch", &in.Hatch, "舱号")
+	parseNumber("tg", &in.Tg, "粮温 Tg")
+	parseNumber("ta", &in.Ta, "舱内气温 Ta")
+	parseNumber("rh", &in.RH, "相对湿度 RH")
+
+	// Range checks (and empty-string checks) live in decision.Evaluate so the
+	// rules cannot diverge from the math package.
+	res, err := decision.Evaluate(in)
+	var verr *decision.ValidationError
+	switch {
+	case errors.As(err, &verr):
+		seen := map[string]bool{}
+		for _, f := range bad {
+			seen[f.Field] = true
+		}
+		for _, f := range verr.Fields {
+			if !seen[f.Field] {
+				bad = append(bad, f)
+				seen[f.Field] = true
+			}
+		}
+	case err != nil:
+		// Evaluate currently fails only with *ValidationError; preserve the
+		// single-submission behaviour of surfacing any other failure to the
+		// caller instead of silently storing an unevaluated row.
+		return in, nil, bad, err
+	}
+	return in, res, bad, nil
+}
+
+// batchRowErrors lists the field-level errors of one batch row; row is the
+// 1-based measurement position so the page can keep every input and scroll to
+// the offending row. The nested field errors use the exact same shape as the
+// single-submission 422.
+type batchRowErrors struct {
+	Row    int                   `json:"row"`
+	Fields []decision.FieldError `json:"fields"`
+}
+
+// createBatchAssessments accepts an ordered array of up to MaxBatchRows
+// measurements: {"measurements":[ {…}, {…}, … ]}.
+//
+// Every row is first parsed and validated with the same pipeline as a single
+// submission. Only if ALL rows are legal does the handler open the store,
+// which inserts them in order in ONE transaction; the in-transaction
+// predecessor lookup reads each chain's latest row — including an earlier row
+// of this same batch — so same-voyage/same-hatch rows chain inside the batch
+// while different hatches still continue their database chain.
+//
+// Any illegal row answers 422 carrying the row number and the original field
+// errors, and the WHOLE batch is rejected before persistence: no partial rows
+// and no predecessor link into a half-saved batch. Malformed document shapes
+// (not an object, measurements not a 1..20 element array, a non-object/
+// duplicate-key/unknown-field row) remain 400 request-format errors.
+func createBatchAssessments(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, ok := readObjectBody(c)
+		if !ok {
+			return
+		}
+		for k := range raw {
+			if k != "measurements" {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "出现未知字段: " + k + "（批量接口仅接受 measurements）",
+				})
+				return
+			}
+		}
+		mraw, present := raw["measurements"]
+		if !present || string(mraw) == "null" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "缺少 measurements：必须是包含 1 至 " +
+					strconv.Itoa(store.MaxBatchRows) + " 个测量对象的 JSON 数组",
+			})
+			return
+		}
+
+		var elems []json.RawMessage
+		if err := json.Unmarshal(mraw, &elems); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "measurements 必须是 JSON 数组: " + err.Error(),
+				"details": err.Error(),
+			})
+			return
+		}
+		if len(elems) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "measurements 不能为空：批量至少提交 1 行测量"})
+			return
+		}
+		if len(elems) > store.MaxBatchRows {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("批量最多 %d 行测量，当前提交了 %d 行", store.MaxBatchRows, len(elems)),
+			})
+			return
+		}
+
+		// Structural check of every element: exactly one object with unique
+		// keys and no trailing bytes. This runs before value validation so a
+		// malformed row is a 400 format error rather than fabricated field
+		// errors for a document that is not an object.
+		rowMaps := make([]map[string]json.RawMessage, len(elems))
+		for i, el := range elems {
+			row := i + 1
+			if err := validateJSONObjectBody(el); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": fmt.Sprintf("批量第 %d 行格式错误：%s", row, err.Error()),
+				})
+				return
+			}
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(el, &m); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": fmt.Sprintf("批量第 %d 行不是合法的 JSON: %v", row, err),
+				})
+				return
+			}
+			if field, bad := unknownField(m, assessmentFields); bad {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": fmt.Sprintf("批量第 %d 行出现未知字段: %s", row, field),
+				})
+				return
+			}
+			rowMaps[i] = m
+		}
+
+		// Value validation per row. Nothing touches the database until every
+		// row parsed cleanly.
+		rows := make([]store.BatchRow, len(rowMaps))
+		var rowErrs []batchRowErrors
+		for i, m := range rowMaps {
+			in, res, bad, evalErr := parseAssessmentFields(m)
+			if evalErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": evalErr.Error()})
+				return
+			}
+			if len(bad) > 0 {
+				rowErrs = append(rowErrs, batchRowErrors{Row: i + 1, Fields: bad})
+				continue
+			}
+			rows[i] = store.BatchRow{Input: in, Result: *res}
+		}
+		if len(rowErrs) > 0 {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error": "批量输入校验失败，整批未保存任何记录",
+				"rows":  rowErrs,
+			})
+			return
+		}
+
+		saved, err := st.CreateBatch(c.Request.Context(), rows)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存失败: " + err.Error()})
+			return
+		}
+		items := make([]gin.H, 0, len(saved))
+		for _, a := range saved {
+			items = append(items, toDTO(a))
+		}
+		c.JSON(http.StatusCreated, gin.H{"count": len(saved), "items": items})
 	}
 }
 

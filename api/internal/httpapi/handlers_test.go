@@ -802,3 +802,351 @@ func TestConstants(t *testing.T) {
 	assert.Equal(t, 1.0, decision.MinRH)
 	assert.Equal(t, 100.0, decision.MaxRH)
 }
+
+// ---- Batch endpoint: POST /api/assessments/batch ----
+
+func batchPath() string { return "/api/assessments/batch" }
+
+func batchBody(rows ...map[string]any) map[string]any {
+	if rows == nil {
+		rows = []map[string]any{}
+	}
+	return map[string]any{"measurements": rows}
+}
+
+func batchRow(voyage, hatch string, tg, ta, rh float64) map[string]any {
+	return map[string]any{"voyage": voyage, "hatch": hatch, "tg": tg, "ta": ta, "rh": rh}
+}
+
+func postBatchRaw(t *testing.T, r http.Handler, raw string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, batchPath(), bytes.NewBufferString(raw))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func postBatch(t *testing.T, r http.Handler, body any) (int, map[string]any) {
+	t.Helper()
+	w := do(t, r, http.MethodPost, batchPath(), body)
+	var got map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	}
+	return w.Code, got
+}
+
+// Successful batch: 201 with count + ordered items, ids ascending in the
+// measurement order, each item the same shape a single POST returns.
+func TestBatch_SuccessReturnsOrderedItems(t *testing.T) {
+	r := setup(t)
+	w, got := postBatch(t, r, batchBody(
+		batchRow("V-B", "1H", 25, 20, 70),
+		batchRow("V-B", "2H", 5, 28, 95),
+		batchRow("V-B", "1H", 24, 20, 70),
+	))
+	require.Equal(t, http.StatusCreated, w, got)
+	assert.Equal(t, float64(3), got["count"])
+	items := got["items"].([]any)
+	require.Len(t, items, 3)
+
+	ids := []float64{}
+	for i, it := range items {
+		row := it.(map[string]any)
+		ids = append(ids, row["id"].(float64))
+		// Same shape as a single POST: formula present, comparison absent.
+		assert.Contains(t, row, "formula", "row %d carries the formula block", i)
+		assert.NotContains(t, row, "comparison", "POST items never carry comparison")
+		assert.Contains(t, row, "delta")
+		assert.Contains(t, row, "delta_display")
+		assert.Contains(t, row, "verdict")
+	}
+	assert.Equal(t, []float64{1, 2, 3}, ids, "items are ordered by creation order")
+
+	verdicts := []string{
+		items[0].(map[string]any)["verdict"].(string),
+		items[1].(map[string]any)["verdict"].(string),
+		items[2].(map[string]any)["verdict"].(string),
+	}
+	assert.Equal(t, []string{"allowed", "denied", "allowed"}, verdicts)
+
+	// The list reflects the real creation order (newest first).
+	wl, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, wl)
+	li := list["items"].([]any)
+	require.Len(t, li, 3)
+	assert.Equal(t, float64(3), li[0].(map[string]any)["id"])
+	assert.Equal(t, float64(2), li[1].(map[string]any)["id"])
+	assert.Equal(t, float64(1), li[2].(map[string]any)["id"])
+}
+
+// Interleaved hatches AND a repeated hatch within one batch: the repeated
+// hatch's later row chains to the earlier batch row; an interleaved hatch and
+// another voyage never cross the chain.
+func TestBatch_PredecessorLinkingInterleavedAndRepeated(t *testing.T) {
+	r := setup(t)
+	w, got := postBatch(t, r, batchBody(
+		batchRow("V-I", "1H", 25, 20, 70), // id1 1H first
+		batchRow("V-I", "2H", 25, 20, 70), // id2 2H first
+		batchRow("V-Z", "1H", 25, 20, 70), // id3 other voyage 1H first
+		batchRow("V-I", "1H", 24, 20, 70), // id4 must chain to id1
+		batchRow("V-I", "2H", 23, 20, 70), // id5 must chain to id2
+		batchRow("V-I", "1H", 26, 20, 70), // id6 must chain to id4 (batch-earlier)
+	))
+	require.Equal(t, http.StatusCreated, w, got)
+
+	detail := func(id float64) map[string]any {
+		wd, d := getMap(t, r, "/api/assessments/"+strconv.FormatFloat(id, 'f', 0, 64))
+		require.Equal(t, http.StatusOK, wd)
+		return d
+	}
+	assert.NotContains(t, detail(1), "comparison", "first measurement of 1H has no predecessor")
+	assert.NotContains(t, detail(2), "comparison", "first measurement of 2H has no predecessor")
+	assert.NotContains(t, detail(3), "comparison", "other voyage starts its own chain")
+
+	d4 := detail(4)["comparison"].(map[string]any)
+	assert.Equal(t, true, d4["available"])
+	assert.Equal(t, float64(1), d4["previous"].(map[string]any)["id"])
+	d5 := detail(5)["comparison"].(map[string]any)
+	assert.Equal(t, float64(2), d5["previous"].(map[string]any)["id"])
+	d6 := detail(6)["comparison"].(map[string]any)
+	assert.Equal(t, float64(4), d6["previous"].(map[string]any)["id"],
+		"the third 1H measurement chains to the earlier BATCH row id4")
+
+	// The per-hatch overview shows each hatch's LAST batch row and nothing
+	// from the other voyage.
+	_, ov := getMap(t, r, "/api/voyages/V-I/hatches/latest")
+	items := ov["items"].([]any)
+	require.Len(t, items, 2)
+	byHatch := map[string]any{}
+	for _, it := range items {
+		row := it.(map[string]any)
+		byHatch[row["hatch"].(string)] = row
+	}
+	assert.Equal(t, float64(6), byHatch["1H"].(map[string]any)["id"])
+	assert.Equal(t, float64(5), byHatch["2H"].(map[string]any)["id"])
+	_, ovz := getMap(t, r, "/api/voyages/V-Z/hatches/latest")
+	zitems := ovz["items"].([]any)
+	require.Len(t, zitems, 1)
+	assert.Equal(t, float64(3), zitems[0].(map[string]any)["id"])
+}
+
+// A batch's new rows continue chains already committed in the DATABASE: a
+// pre-existing single row for a voyage+hatch is the predecessor of that
+// hatch's first batch row.
+func TestBatch_RowsContinueExistingDatabaseChain(t *testing.T) {
+	r := setup(t)
+	// One earlier single submission for V-P/7H.
+	wp, pre := postMap(t, r, batchRow("V-P", "7H", 25, 20, 70))
+	require.Equal(t, http.StatusCreated, wp)
+
+	w, got := postBatch(t, r, batchBody(
+		batchRow("V-P", "8H", 25, 20, 70), // other hatch: first
+		batchRow("V-P", "7H", 24, 20, 70), // continues the pre-batch chain
+	))
+	require.Equal(t, http.StatusCreated, w, got)
+	items := got["items"].([]any)
+	sevenH := items[1].(map[string]any)
+
+	wd, d := getMap(t, r, "/api/assessments/"+
+		strconv.FormatFloat(sevenH["id"].(float64), 'f', 0, 64))
+	require.Equal(t, http.StatusOK, wd)
+	cmp := d["comparison"].(map[string]any)
+	assert.Equal(t, true, cmp["available"])
+	assert.Equal(t, pre["id"], cmp["previous"].(map[string]any)["id"],
+		"the batch row takes over the most recent valid DB predecessor")
+}
+
+// A middle row out of range rejects the WHOLE batch with 422: the response
+// names the row (1-based) and the original field error, and no row at all is
+// persisted, including the legal rows before and after it.
+func TestBatch_MiddleInvalidRowRollsBackWholeBatch(t *testing.T) {
+	r := setup(t)
+	w, got := postBatch(t, r, batchBody(
+		batchRow("V-R", "1H", 25, 20, 70),  // legal
+		batchRow("V-R", "1H", 999, 20, 70), // row 2: tg out of range
+		batchRow("V-R", "1H", 26, 20, 70),  // legal but must not be saved
+	))
+	require.Equal(t, http.StatusUnprocessableEntity, w, got)
+	assert.Contains(t, got["error"].(string), "批量")
+	rowErrs := got["rows"].([]any)
+	require.Len(t, rowErrs, 1, "only the offending row is reported")
+	re := rowErrs[0].(map[string]any)
+	assert.Equal(t, float64(2), re["row"], "the 1-based row number identifies the middle row")
+	fields := re["fields"].([]any)
+	require.Len(t, fields, 1)
+	fe := fields[0].(map[string]any)
+	assert.Equal(t, "tg", fe["field"])
+	assert.Equal(t, "out_of_range", fe["code"])
+	assert.NotEmpty(t, fe["message"])
+	// The original single-row error envelope is not used for a batch.
+	assert.NotContains(t, got, "fields")
+
+	wl, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, wl)
+	assert.Empty(t, list["items"], "an invalid batch persists nothing")
+}
+
+// Multiple bad rows are all reported at once, each with its own row number and
+// original field errors, and the whole batch is still rolled back.
+func TestBatch_MultipleInvalidRowsReportedTogetherAndRolledBack(t *testing.T) {
+	r := setup(t)
+	w, got := postBatch(t, r, batchBody(
+		batchRow("V-M", "1H", 25, 20, 0),   // row1: rh below 1
+		batchRow("V-M", "1H", 25, 200, 70), // row2: ta out of range
+		batchRow("V-M", "1H", 26, 20, 70),  // row3: legal
+	))
+	require.Equal(t, http.StatusUnprocessableEntity, w, got)
+	rowErrs := got["rows"].([]any)
+	require.Len(t, rowErrs, 2)
+	assert.Equal(t, float64(1), rowErrs[0].(map[string]any)["row"])
+	assert.Equal(t, "rh", rowErrs[0].(map[string]any)["fields"].([]any)[0].(map[string]any)["field"])
+	assert.Equal(t, float64(2), rowErrs[1].(map[string]any)["row"])
+	assert.Equal(t, "ta", rowErrs[1].(map[string]any)["fields"].([]any)[0].(map[string]any)["field"])
+
+	wl, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, wl)
+	assert.Empty(t, list["items"])
+}
+
+// Empty voyage on a batch row is a 422 row field error (not a 400), using the
+// exact validation pipeline of a single submission.
+func TestBatch_RowFieldValidationMatchesSingle(t *testing.T) {
+	r := setup(t)
+
+	// Non-finite literal 1e999 in row 3 -> not_finite on tg, row reported.
+	w := postBatchRaw(t, r, `{"measurements":[
+		{"voyage":"V-N","hatch":"H","tg":25,"ta":20,"rh":70},
+		{"voyage":"V-N","hatch":"H","tg":25,"ta":20,"rh":70},
+		{"voyage":"V-N","hatch":"H","tg":1e999,"ta":20,"rh":70}
+	]}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, w.Body.String())
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	re := got["rows"].([]any)[0].(map[string]any)
+	assert.Equal(t, float64(3), re["row"])
+	fe := re["fields"].([]any)[0].(map[string]any)
+	assert.Equal(t, "tg", fe["field"])
+	assert.Equal(t, "not_finite", fe["code"])
+
+	// A nested OBJECT as a field value is a value-level wrong_type (422), just
+	// like the single endpoint — not a structural 400.
+	w2 := postBatchRaw(t, r, `{"measurements":[
+		{"voyage":"V-N","hatch":"H","tg":{},"ta":20,"rh":70}
+	]}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w2.Code, w2.Body.String())
+	var got2 map[string]any
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &got2))
+	fe2 := got2["rows"].([]any)[0].(map[string]any)["fields"].([]any)[0].(map[string]any)
+	assert.Equal(t, "tg", fe2["field"])
+	assert.Equal(t, "wrong_type", fe2["code"])
+
+	// An empty (whitespace-only) voyage string is a required 422, and nothing
+	// is saved.
+	w3 := postBatchRaw(t, r, `{"measurements":[
+		{"voyage":"   ","hatch":"H","tg":25,"ta":20,"rh":70}
+	]}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w3.Code, w3.Body.String())
+	var got3 map[string]any
+	require.NoError(t, json.Unmarshal(w3.Body.Bytes(), &got3))
+	fe3 := got3["rows"].([]any)[0].(map[string]any)["fields"].([]any)[0].(map[string]any)
+	assert.Equal(t, "voyage", fe3["field"])
+}
+
+// Structural problems with the batch DOCUMENT are 400 format errors, never a
+// fabricated 422: top-level not an array-shaped field, missing measurements,
+// non-array, empty, over the cap, a non-object row, a duplicate key inside a
+// row, an unknown key, or trailing junk / a repeated top-level key.
+func TestBatch_StructuralErrorsAre400(t *testing.T) {
+	r := setup(t)
+
+	must400 := func(raw, hint string) {
+		t.Helper()
+		w := postBatchRaw(t, r, raw)
+		require.Equalf(t, http.StatusBadRequest, w.Code, "%s -> %d %s", hint, w.Code, w.Body.String())
+		var got map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.NotEmpty(t, got["error"], hint)
+		assert.NotContains(t, got, "rows", "%s is a format error, not per-row validation", hint)
+	}
+
+	must400(`null`, "top-level null")
+	must400(`[]`, "top-level array")
+	must400(`{"measurements":null}`, "measurements null")
+	must400(`{"other":[]}`, "missing measurements")
+	must400(`{"measurements":{}}`, "measurements not an array")
+	must400(`{"measurements":[]}`, "empty array")
+	must400(`{"measurements":[
+		{"voyage":"V","hatch":"H","tg":25,"ta":20,"rh":70}]]}`, "stray bracket after the array")
+	must400(`{"measurements":[
+		{"voyage":"V","hatch":"H","tg":25,"ta":20,"rh":70,"rh":1}]}`, "duplicate key in row")
+	must400(`{"measurements":[
+		{"voyage":"V","hatch":"H","tg":25,"ta":20,"rh":70,"x":1}]}`, "unknown key in row")
+	must400(`{"measurements":[
+		{"voyage":"V","hatch":"H","tg":25,"ta":20,"rh":70}, 123]}`, "non-object row")
+	must400(`{"measurements":[
+		{"voyage":"V","hatch":"H","tg":25,"ta":20,"rh":70}], "extra":1}`, "unknown top-level key")
+
+	// Over the 20-row cap: 21 rows -> 400.
+	var sb bytes.Buffer
+	sb.WriteString(`{"measurements":[`)
+	good := `{"voyage":"V","hatch":"H","tg":25,"ta":20,"rh":70}`
+	for i := 0; i < store.MaxBatchRows+1; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(good)
+	}
+	sb.WriteString(`]}`)
+	w := postBatchRaw(t, r, sb.String())
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	var capResp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &capResp))
+	assert.Contains(t, capResp["error"].(string), strconv.Itoa(store.MaxBatchRows))
+
+	// None of the rejected structural requests persisted.
+	wl, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, wl)
+	assert.Empty(t, list["items"])
+}
+
+// Exactly MaxBatchRows is accepted; it chains into a single long chain.
+func TestBatch_ExactlyMaxRowsAccepted(t *testing.T) {
+	r := setup(t)
+	rows := make([]map[string]any, store.MaxBatchRows)
+	for i := range rows {
+		rows[i] = batchRow("V-MAX", "1H", 25, 20, 70)
+	}
+	w, got := postBatch(t, r, batchBody(rows...))
+	require.Equal(t, http.StatusCreated, w, got)
+	assert.Equal(t, float64(store.MaxBatchRows), got["count"])
+
+	// The last row chains back through the batch (predecessor id = n-1).
+	wd, d := getMap(t, r, "/api/assessments/"+strconv.Itoa(store.MaxBatchRows))
+	require.Equal(t, http.StatusOK, wd)
+	cmp := d["comparison"].(map[string]any)
+	assert.Equal(t, true, cmp["available"])
+	assert.Equal(t, float64(store.MaxBatchRows-1), cmp["previous"].(map[string]any)["id"])
+}
+
+// The single endpoint keeps working identically after the batch route is
+// added: /api/assessments still accepts one object and returns one DTO, and
+// the static /batch segment is never swallowed by the :id route.
+func TestBatch_SingleEndpointAndRoutingStayCompatible(t *testing.T) {
+	r := setup(t)
+
+	// Single create is unchanged.
+	w, one := postMap(t, r, validBody())
+	require.Equal(t, http.StatusCreated, w, one)
+	assert.Contains(t, one, "formula")
+	assert.NotContains(t, one, "comparison")
+	assert.NotContains(t, one, "items")
+
+	// GET /assessments/batch must NOT match GET /assessments/:id (it is a
+	// POST-only resource; a GET is 404/405, never treated as id="batch").
+	req := httptest.NewRequest(http.MethodGet, batchPath(), nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code, "GET /batch is not an assessment id")
+}

@@ -40,3 +40,17 @@ export async function createAssessment(payload) {
   })
   return parse(res)
 }
+
+// Batch entry: one ordered array of up to 20 measurements, saved by the
+// server in a single transaction. On 422 the body is
+// { error, rows: [{ row, fields: [...] }] } where row is 1-based; the page
+// keeps every input and highlights the offending rows. The browser only
+// renders the returned ids/deltas/verdicts, never computing them itself.
+export async function createBatchAssessments(measurements) {
+  const res = await fetch(`${BASE}/assessments/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ measurements }),
+  })
+  return parse(res)
+}

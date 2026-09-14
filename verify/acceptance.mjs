@@ -31,6 +31,25 @@ async function post(body) {
   return { status: res.status, body: text ? JSON.parse(text) : null }
 }
 
+// Batch submission helper. The ordered measurements array is saved in one
+// transaction; 201 -> { count, items:[<single DTO>…] }, 422 -> { rows:[{row,
+// fields}] } with 1-based row numbers.
+async function postBatch(measurements) {
+  const res = await fetch(`${BASE}/api/assessments/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ measurements }),
+  })
+  const text = await res.text()
+  return { status: res.status, body: text ? JSON.parse(text) : null }
+}
+
+function magnus(m) {
+  const gamma = Math.log(m.rh / 100) + (A * m.ta) / (B + m.ta)
+  const td = (B * gamma) / (A - gamma)
+  return { gamma, td, delta: m.tg - td }
+}
+
 async function main() {
   // 1. Health.
   const h = await fetch(`${BASE}/api/healthz`).then((r) => r.json())
@@ -183,6 +202,134 @@ async function main() {
   const sampleDetail = await fetch(`${BASE}/api/assessments/${body.id}`).then((r) => r.json())
   expect(sampleDetail.formula && sampleDetail.comparison === undefined,
     'detail of the first measurement keeps formula and no comparison')
+
+  // 3d. BATCH endpoint: one ordered array saved in a single transaction.
+  // The probe independently checks in-batch predecessor linking with
+  // interleaved AND repeated hatches, the per-hatch overview's latest row,
+  // and whole-batch atomicity when a MIDDLE row is out of range.
+  const bVoy = 'ACCEPT-BATCH'
+  const bOther = 'ACCEPT-BATCH-OTHER'
+  const batchRows = [
+    { voyage: bVoy, hatch: '1H', tg: 25, ta: 20, rh: 70 },  // 1: 1H first
+    { voyage: bVoy, hatch: '2H', tg: 24, ta: 20, rh: 70 },  // 2: 2H first
+    { voyage: bOther, hatch: '1H', tg: 25, ta: 20, rh: 70 },// 3: other voyage
+    { voyage: bVoy, hatch: '1H', tg: 23.5, ta: 21, rh: 75 },// 4: repeat 1H -> 1
+    { voyage: bVoy, hatch: '2H', tg: 30, ta: 20, rh: 70 },  // 5: repeat 2H -> 2
+    { voyage: bVoy, hatch: '1H', tg: 26, ta: 20, rh: 70 },  // 6: repeat 1H -> 4
+  ]
+  const batchRes = await postBatch(batchRows)
+  expect(batchRes.status === 201, `batch of 6 is 201 (got ${batchRes.status})`)
+  expect(batchRes.body.count === 6, 'batch response count is 6')
+  expect(Array.isArray(batchRes.body.items) && batchRes.body.items.length === 6,
+    'batch response carries six items in order')
+  const bid = batchRes.body.items.map((it) => it.id)
+  for (let i = 1; i < bid.length; i++) {
+    expect(bid[i] === bid[i - 1] + 1, 'batch item ids are consecutive in creation order')
+  }
+  // Every item is the same single-assessment DTO shape (formula present,
+  // comparison absent) and matches the probe's own recomputation.
+  batchRes.body.items.forEach((it, i) => {
+    const m = magnus(batchRows[i])
+    expect(Math.abs(it.delta - m.delta) < 1e-12, `batch row ${i + 1} Δ matches independent math`)
+    expect(!!it.formula && it.comparison === undefined,
+      `batch row ${i + 1} keeps the single-DTO shape (formula yes, comparison no)`)
+  })
+
+  const bDetail = async (idx) =>
+    fetch(`${BASE}/api/assessments/${bid[idx]}`).then((r) => r.json())
+  expect((await bDetail(0)).comparison === undefined, 'in-batch first 1H measurement has no predecessor')
+  expect((await bDetail(1)).comparison === undefined, 'in-batch first 2H measurement has no predecessor')
+  expect((await bDetail(2)).comparison === undefined, 'other-voyage 1H is an independent first measurement')
+
+  const b4 = await bDetail(3)
+  expect(b4.comparison.available === true && b4.comparison.previous.id === bid[0],
+    'later 1H row links to the EARLIER same-hatch batch row, not the interleaved 2H row')
+  const b5 = await bDetail(4)
+  expect(b5.comparison.available === true && b5.comparison.previous.id === bid[1],
+    'later 2H row links to its own earlier batch row')
+  const b6 = await bDetail(5)
+  expect(b6.comparison.available === true && b6.comparison.previous.id === bid[3],
+    'the third 1H row links to the immediately preceding in-batch 1H row')
+
+  // The other voyage's 1H must not be linked to the identically-numbered 1H
+  // rows of bVoy: it has no predecessor and the overview isolates it.
+  const b3 = await bDetail(2)
+  expect(b3.voyage === bOther, 'other-voyage row really belongs to the other voyage')
+
+  // Overview latest per hatch = the LAST batch row of each hatch (MAX id).
+  const bOvRes = await fetch(`${BASE}/api/voyages/${encodeURIComponent(bVoy)}/hatches/latest`)
+  expect(bOvRes.status === 200, 'batch voyage overview is 200')
+  const bOv = await bOvRes.json()
+  const bByHatch = Object.fromEntries(bOv.items.map((it) => [it.hatch, it]))
+  expect(Object.keys(bByHatch).sort().join(',') === '1H,2H', 'one latest snapshot per batch hatch')
+  expect(bByHatch['1H'].id === bid[5] && bByHatch['2H'].id === bid[4],
+    'overview latest items are the repeated rows (true creation order)')
+  const bOvOther = await fetch(`${BASE}/api/voyages/${encodeURIComponent(bOther)}/hatches/latest`)
+    .then((r) => r.json())
+  expect(bOvOther.items.length === 1 && bOvOther.items[0].id === bid[2],
+    'the interleaved other voyage is isolated despite the shared hatch number')
+
+  // The history list reflects the real creation order immediately: the five
+  // bVoy rows (batch indices 0,1,3,4,5) appear newest-first, and the other
+  // voyage's row (bid[2]) is never among them.
+  const bList = await fetch(`${BASE}/api/assessments`).then((r) => r.json())
+  const bVoyIds = bList.items.filter((i) => i.voyage === bVoy).map((i) => i.id)
+  expect(bVoyIds.join(',') === [bid[5], bid[4], bid[3], bid[1], bid[0]].join(','),
+    'history lists the batch rows newest-first in true creation order')
+
+  // A batch's new rows ALSO continue a chain that already existed in the
+  // database (single POST first, then a batch repeat of the same hatch).
+  const pre = await post({ voyage: 'ACCEPT-BATCH-PRE', hatch: '9H', tg: 25, ta: 20, rh: 70 })
+  expect(pre.status === 201, 'pre-batch single submission is 201')
+  const cont = await postBatch([
+    { voyage: 'ACCEPT-BATCH-PRE', hatch: '8H', tg: 25, ta: 20, rh: 70 },
+    { voyage: 'ACCEPT-BATCH-PRE', hatch: '9H', tg: 24, ta: 20, rh: 70 },
+  ])
+  expect(cont.status === 201, 'continuation batch is 201')
+  const contDetail = await fetch(`${BASE}/api/assessments/${cont.body.items[1].id}`).then((r) => r.json())
+  expect(contDetail.comparison.available === true &&
+    contDetail.comparison.previous.id === pre.body.id,
+    'a batch row continues the most recent valid DB predecessor for its hatch')
+
+  // An out-of-range MIDDLE row rejects the WHOLE batch with a 1-based row
+  // number and the original field error; nothing (including the legal rows
+  // before and after it) may be persisted — no partial rows, no broken link.
+  const rollVoy = 'ACCEPT-BATCH-ROLLBACK'
+  const beforeBatch = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
+  const roll = await postBatch([
+    { voyage: rollVoy, hatch: '1H', tg: 25, ta: 20, rh: 70 },  // legal
+    { voyage: rollVoy, hatch: '1H', tg: 999, ta: 20, rh: 70 }, // row 2: out of range
+    { voyage: rollVoy, hatch: '2H', tg: 26, ta: 20, rh: 70 },  // legal, must not save
+  ])
+  expect(roll.status === 422, `middle out-of-range row is 422 (got ${roll.status})`)
+  expect(roll.body.rows.length === 1 && roll.body.rows[0].row === 2, '422 names row 2')
+  const rf = roll.body.rows[0].fields[0]
+  expect(rf.field === 'tg' && rf.code === 'out_of_range', 'the original tg field error is returned')
+  const afterBatch = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
+  expect(afterBatch === beforeBatch, 'the whole invalid batch persisted no rows')
+  const rollList = await fetch(`${BASE}/api/assessments`).then((r) => r.json())
+  expect(rollList.items.every((i) => i.voyage !== rollVoy),
+    'no row of the rolled-back voyage exists (no partial chain)')
+
+  // Structural guards stay 400 (request-format errors), not 422, and save nothing.
+  for (const [hint, payload] of [
+    ['empty array', { measurements: [] }],
+    ['over cap', { measurements: Array.from({ length: 21 }, () => ({
+      voyage: rollVoy, hatch: '1H', tg: 25, ta: 20, rh: 70 })) }],
+    ['non-array', { measurements: {} }],
+  ]) {
+    const rr = await fetch(`${BASE}/api/assessments/batch`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    })
+    expect(rr.status === 400, `${hint} is a 400 format error (got ${rr.status})`)
+  }
+  const nonObject = await fetch(`${BASE}/api/assessments/batch`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ measurements: [{ voyage: 'x', hatch: 'y', tg: 25, ta: 20, rh: 70 }, 123] }),
+  })
+  expect(nonObject.status === 400, 'a non-object row is a 400 format error')
+  const afterStruct = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
+  expect(afterStruct === afterBatch, 'structural rejections persist nothing')
 
   // 4. Denied and retest zones.
   const denied = await post({ voyage: 'ACCEPT-2', hatch: '1P', tg: 5, ta: 28, rh: 95 })
