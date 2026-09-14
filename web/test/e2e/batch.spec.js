@@ -130,8 +130,13 @@ test('batch UI: an out-of-range middle row is blocked, located and inputs are ke
   expect(await page.inputValue('#bf-1-tg')).toBe('999')
   expect(await page.inputValue('#bf-2-tg')).toBe('26')
 
-  // Correcting only the middle row and resubmitting saves all three.
+  // Correcting only the middle row clears its stale marking BEFORE resubmit;
+  // previously the old error stayed on screen until the next submit.
   await page.fill('#bf-1-tg', '24')
+  await expect(page.locator('[data-test=batch-row].batch-row-invalid')).toHaveCount(0)
+  await expect(page.locator('#berr-1-tg')).toHaveCount(0)
+  await expect(page.locator('[data-test=batch-banner]')).toHaveCount(0)
+
   await submitBatch(page)
   await expect(page.locator('[data-test=batch-result-row]')).toHaveCount(3)
 
@@ -200,4 +205,57 @@ test('real API: an out-of-range middle row rolls back the WHOLE batch (no partia
     .get(`/api/assessments/${saved.items[1].id}`).then((r) => r.json())
   expect(secondDetail.comparison.available).toBe(true)
   expect(secondDetail.comparison.previous.id).toBe(saved.items[0].id)
+})
+
+test('batch UI: deleting the normal row in front keeps the error marker on the same measurement', async ({ page }) => {
+  const voy = `V-BATCH-MOVE-${RUN}`
+  await switchToBatch(page)
+  await addRows(page, 3)
+  await fillRow(page, 0, { voyage: voy, hatch: '1H', tg: '25', ta: '20', rh: '70' })
+  await fillRow(page, 1, { voyage: voy, hatch: '2H', tg: '999', ta: '20', rh: '70' }) // flagged
+  await fillRow(page, 2, { voyage: voy, hatch: '3H', tg: '26', ta: '20', rh: '70' })
+
+  await submitBatch(page)
+  let invalid = page.locator('[data-test=batch-row].batch-row-invalid')
+  await expect(invalid).toHaveCount(1)
+  await expect(invalid.first()).toHaveAttribute('data-row', '2')
+
+  // Delete the healthy first row. The marker must follow the flagged 2H row
+  // (now row 1), never transfer to the measurement that shifted beneath it.
+  await page.locator('[data-test=batch-remove-row]').first().click()
+  invalid = page.locator('[data-test=batch-row].batch-row-invalid')
+  await expect(invalid).toHaveCount(1)
+  await expect(invalid.first()).toHaveAttribute('data-row', '1')
+  await expect(page.locator('#bf-0-hatch')).toHaveValue('2H')
+  await expect(page.locator('#berr-0-tg')).toContainText('60.0')
+  // The untouched third row is healthy.
+  await expect(page.locator('[data-test=batch-row]')).toHaveCount(2)
+  await expect(page.locator('[data-test=batch-row].batch-row-invalid')).toHaveCount(1)
+
+  // Deleting the flagged row itself clears the marker and banner entirely.
+  await page.locator('[data-test=batch-row].batch-row-invalid [data-test=batch-remove-row]').click()
+  await expect(page.locator('[data-test=batch-row].batch-row-invalid')).toHaveCount(0)
+  await expect(page.locator('[data-test=batch-banner]')).toHaveCount(0)
+})
+
+test('batch UI: any edit after a successful save hides the stale verdict panel', async ({ page }) => {
+  const voy = `V-BATCH-STALE-${RUN}`
+  await switchToBatch(page)
+  await addRows(page, 2)
+  await fillRow(page, 0, { voyage: voy, hatch: '1H', tg: '25', ta: '20', rh: '70' })
+  await fillRow(page, 1, { voyage: voy, hatch: '2H', tg: '24', ta: '20', rh: '70' })
+
+  await submitBatch(page)
+  await expect(page.locator('[data-test=batch-result-row]')).toHaveCount(2)
+
+  // Typing into a saved cell must not leave the pre-edit conclusions visible.
+  await page.fill('#bf-0-tg', '25.5')
+  await expect(page.locator('[data-test=batch-result]')).toHaveCount(0)
+  await expect(page.locator('[data-test=batch-result-row]')).toHaveCount(0)
+
+  // Adding a line invalidates it too (and resubmitting restores a fresh panel).
+  await submitBatch(page)
+  await expect(page.locator('[data-test=batch-result-row]')).toHaveCount(2)
+  await page.click('[data-test=batch-add-row]')
+  await expect(page.locator('[data-test=batch-result]')).toHaveCount(0)
 })

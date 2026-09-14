@@ -223,4 +223,167 @@ describe('HomePage batch mode', () => {
     expect(w.find('[data-test=batch-banner]').text()).toContain('不能为空')
     expect(w.find('#bf-0-voyage').element.value).toBe('V-B')
   })
+
+  it('clears a stale field error as soon as the flagged field is edited', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"items":[]}', { status: 200 }),
+    )
+    const w = mountPage()
+    await flushPromises()
+    await switchToBatch(w)
+    await w.find('[data-test=batch-add-row]').trigger('click')
+    await fillRow(w, 0, { voyage: 'V-B', hatch: '1H', tg: 25, ta: 20, rh: 70 })
+    await fillRow(w, 1, { voyage: 'V-B', hatch: '1H', tg: 999, ta: 20, rh: 70 })
+    await submitBatch(w)
+
+    // Row 2 is flagged and named in the banner.
+    expect(w.findAll('[data-test=batch-row].batch-row-invalid')).toHaveLength(1)
+    expect(w.find('#berr-1-tg').exists()).toBe(true)
+    expect(w.find('[data-test=batch-banner]').text()).toContain('第 2 行')
+
+    // Fixing the bad field removes THAT error, the row marking and the banner
+    // without waiting for another submission.
+    await w.find('#bf-1-tg').setValue('24')
+    expect(w.find('#berr-1-tg').exists()).toBe(false)
+    expect(w.find('#bf-1-tg').attributes('aria-invalid')).toBe('false')
+    expect(w.findAll('[data-test=batch-row].batch-row-invalid')).toHaveLength(0)
+    expect(w.find('[data-test=batch-banner]').exists()).toBe(false)
+  })
+
+  it('drops only the edited field error while other flagged fields stay', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"items":[]}', { status: 200 }),
+    )
+    const w = mountPage()
+    await flushPromises()
+    await switchToBatch(w)
+    // tg out of range AND rh out of range on the same single row.
+    await fillRow(w, 0, { voyage: 'V-B', hatch: '1H', tg: 999, ta: 20, rh: 120 })
+    await submitBatch(w)
+
+    expect(w.find('#berr-0-tg').exists()).toBe(true)
+    expect(w.find('#berr-0-rh').exists()).toBe(true)
+
+    await w.find('#bf-0-tg').setValue('24')
+    expect(w.find('#berr-0-tg').exists()).toBe(false)
+    expect(w.find('#berr-0-rh').exists()).toBe(true)
+    // One flagged field remains, so the row and banner stay.
+    expect(w.findAll('[data-test=batch-row].batch-row-invalid')).toHaveLength(1)
+    expect(w.find('[data-test=batch-banner]').exists()).toBe(true)
+  })
+
+  it('keeps a server 422 marker on the same measurement after a preceding row is deleted', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init = {}) => {
+      if (init.method === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({
+          error: '批量输入校验失败，整批未保存任何记录',
+          rows: [{ row: 2, fields: [{ field: 'tg', code: 'out_of_range', message: '粮温 Tg必须在 -20.0 至 60.0 之间' }] }],
+        }), { status: 422, headers: { 'Content-Type': 'application/json' } }))
+      }
+      return Promise.resolve(new Response('{"items":[]}', { status: 200 }))
+    })
+
+    const w = mountPage()
+    await flushPromises()
+    await switchToBatch(w)
+    await w.find('[data-test=batch-add-row]').trigger('click')
+    await fillRow(w, 0, { voyage: 'V-B', hatch: '1H', tg: 25, ta: 20, rh: 70 })
+    await fillRow(w, 1, { voyage: 'V-B', hatch: '2H', tg: 24, ta: 20, rh: 70 })
+    await submitBatch(w)
+    expect(w.findAll('[data-test=batch-row].batch-row-invalid')[0].attributes('data-row')).toBe('2')
+
+    // Delete the NORMAL row in front. The marker must follow the flagged
+    // measurement (now position 1), never jump onto a different one.
+    await w.findAll('[data-test=batch-remove-row]')[0].trigger('click')
+    await flushPromises()
+
+    const invalid = w.findAll('[data-test=batch-row].batch-row-invalid')
+    expect(invalid).toHaveLength(1)
+    expect(invalid[0].attributes('data-row')).toBe('1')
+    expect(w.find('#bf-0-tg').element.value).toBe('24')
+    expect(w.find('#berr-0-tg').text()).toContain('60.0')
+  })
+
+  it('clears the marker and banner when the flagged row itself is deleted', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init = {}) => {
+      if (init.method === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({
+          error: '批量输入校验失败',
+          rows: [{ row: 2, fields: [{ field: 'tg', code: 'out_of_range', message: '粮温 Tg必须在 -20.0 至 60.0 之间' }] }],
+        }), { status: 422, headers: { 'Content-Type': 'application/json' } }))
+      }
+      return Promise.resolve(new Response('{"items":[]}', { status: 200 }))
+    })
+
+    const w = mountPage()
+    await flushPromises()
+    await switchToBatch(w)
+    await w.find('[data-test=batch-add-row]').trigger('click')
+    await fillRow(w, 0, { voyage: 'V-B', hatch: '1H', tg: 25, ta: 20, rh: 70 })
+    await fillRow(w, 1, { voyage: 'V-B', hatch: '2H', tg: 24, ta: 20, rh: 70 })
+    await submitBatch(w)
+
+    await w.findAll('[data-test=batch-remove-row]')[1].trigger('click')
+    await flushPromises()
+    expect(w.findAll('[data-test=batch-row].batch-row-invalid')).toHaveLength(0)
+    expect(w.find('[data-test=batch-banner]').exists()).toBe(false)
+  })
+
+  it('renumbers the local banner when rows in front of a flagged one are removed', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"items":[]}', { status: 200 }),
+    )
+    const w = mountPage()
+    await flushPromises()
+    await switchToBatch(w)
+    await w.find('[data-test=batch-add-row]').trigger('click')
+    await w.find('[data-test=batch-add-row]').trigger('click')
+    await fillRow(w, 0, { voyage: 'V-B', hatch: '1H', tg: 25, ta: 20, rh: 70 })
+    await fillRow(w, 1, { voyage: 'V-B', hatch: '1H', tg: 25, ta: 20, rh: 70 })
+    await fillRow(w, 2, { voyage: 'V-B', hatch: '1H', tg: 999, ta: 20, rh: 70 })
+    await submitBatch(w)
+    expect(w.find('[data-test=batch-banner]').text()).toContain('第 3 行')
+
+    // Delete the healthy first row; the flagged measurement moves up.
+    await w.findAll('[data-test=batch-remove-row]')[0].trigger('click')
+    await flushPromises()
+    const banner = w.find('[data-test=batch-banner]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('第 2 行')
+    expect(banner.text()).not.toContain('第 3 行')
+  })
+
+  it('invalidates a successful batch result as soon as the grid is edited', async () => {
+    const saved = [
+      batchItem(10, { id: 10 }),
+      batchItem(11, { id: 11, hatch: '2H', delta: -22, delta_display: -22, verdict: 'denied' }),
+    ]
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init = {}) => {
+      if (init.method === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({ count: 2, items: saved }), {
+          status: 201, headers: { 'Content-Type': 'application/json' },
+        }))
+      }
+      return Promise.resolve(new Response(JSON.stringify({ items: [...saved].reverse() }), { status: 200 }))
+    })
+
+    const w = mountPage()
+    await flushPromises()
+    await switchToBatch(w)
+    await w.find('[data-test=batch-add-row]').trigger('click')
+    await fillRow(w, 0, { voyage: 'V-B', hatch: '1H', tg: 25, ta: 20, rh: 70 })
+    await fillRow(w, 1, { voyage: 'V-B', hatch: '2H', tg: 5, ta: 28, rh: 95 })
+    await submitBatch(w)
+    expect(w.findAll('[data-test=batch-result-row]')).toHaveLength(2)
+
+    // Editing a saved cell must not leave the old verdicts on screen.
+    await w.find('#bf-0-tg').setValue('26')
+    expect(w.find('[data-test=batch-result]').exists()).toBe(false)
+
+    // Adding a line also invalidates the result.
+    await submitBatch(w)
+    expect(w.findAll('[data-test=batch-result-row]')).toHaveLength(2)
+    await w.find('[data-test=batch-add-row]').trigger('click')
+    expect(w.find('[data-test=batch-result]').exists()).toBe(false)
+  })
 })

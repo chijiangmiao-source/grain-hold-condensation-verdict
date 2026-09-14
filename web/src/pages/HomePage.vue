@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { createAssessment, createBatchAssessments, listAssessments } from '@/lib/api.js'
 import VerdictBadge from '@/components/VerdictBadge.vue'
@@ -31,17 +31,26 @@ const submitting = ref(false)
 const latest = ref(null)
 
 // ---- batch mode ----
+let batchRowSeq = 0
 function emptyBatchRow(prev = null) {
   // A new line inherits the previous line's voyage/hatch: consecutive
   // multi-hatch transcription usually keeps the voyage, and repeating a hatch
   // is a normal repeat measurement. The measured temperatures never copy.
-  return { voyage: prev?.voyage ?? '', hatch: prev?.hatch ?? '', tg: '', ta: '', rh: '' }
+  //
+  // uid is a row IDENTITY: validation markers attach to it, so deleting a line
+  // in front of a flagged one can never shift the marker onto another row.
+  return { uid: ++batchRowSeq, voyage: prev?.voyage ?? '', hatch: prev?.hatch ?? '', tg: '', ta: '', rh: '' }
 }
 const batchRows = ref([emptyBatchRow()])
-// Row-level failures mirror the server 422 envelope:
-// [{ row: 1-based, fields: [{ field, code, message }] }].
+// Row-level failures keyed by the row's stable uid:
+// [{ uid, fields: [{ field, code, message }] }]. Server 422 rows (1-based
+// positions) are mapped to uids at receipt time.
 const batchRowErrors = ref([])
 const batchSubmitError = ref('')
+// Which kind of banner is showing, so edits can keep it in sync:
+// 'local' lists the offending positions; 'server' holds the rejection text.
+// Anything else (connect/400 error) is left untouched until the next submit.
+const batchErrorKind = ref('')
 const batchSending = ref(false)
 const batchResult = ref(null) // { count, items } on 201
 
@@ -49,14 +58,22 @@ function errFor(key) {
   return errors[key]?.message || ''
 }
 
+function batchErrorEntry(index) {
+  const row = batchRows.value[index]
+  return row ? batchRowErrors.value.find((r) => r.uid === row.uid) : null
+}
 function batchFieldError(index, key) {
-  const re = batchRowErrors.value.find((r) => r.row === index + 1)
-  return re?.fields.find((f) => f.field === key) || null
+  return batchErrorEntry(index)?.fields.find((f) => f.field === key) || null
 }
 function batchRowInvalid(index) {
-  return batchRowErrors.value.some((r) => r.row === index + 1)
+  return !!batchErrorEntry(index)
 }
-const batchProblemRows = computed(() => batchRowErrors.value.map((r) => r.row))
+// Current 1-based positions of flagged rows, in grid order.
+const batchProblemRows = computed(() =>
+  batchRows.value
+    .map((row, i) => (batchRowErrors.value.some((r) => r.uid === row.uid) ? i + 1 : 0))
+    .filter((n) => n > 0),
+)
 
 function addBatchRow() {
   if (batchRows.value.length >= MAX_BATCH_ROWS) return
@@ -64,8 +81,52 @@ function addBatchRow() {
 }
 function removeBatchRow(index) {
   if (batchRows.value.length <= 1) return
-  batchRows.value.splice(index, 1)
+  const [removed] = batchRows.value.splice(index, 1)
+  // The marker belongs to the deleted MEASUREMENT, so it leaves with it; it
+  // must never be inherited by the row that moves into its position.
+  if (batchRowErrors.value.some((r) => r.uid === removed.uid)) {
+    batchRowErrors.value = batchRowErrors.value.filter((r) => r.uid !== removed.uid)
+  }
+  syncBatchBanner()
 }
+
+// Editing a flagged field clears THAT field's stale message immediately; once
+// a row has no flagged fields left its row marker goes too.
+function onBatchFieldInput(index, key) {
+  const entry = batchErrorEntry(index)
+  if (!entry) return
+  const remaining = entry.fields.filter((f) => f.field !== key)
+  if (remaining.length === entry.fields.length) return
+  batchRowErrors.value = batchRowErrors.value
+    .map((r) => (r.uid === entry.uid ? { ...r, fields: remaining } : r))
+    .filter((r) => r.fields.length > 0)
+  syncBatchBanner()
+}
+
+// Keep a validation banner consistent with the markers still present: the
+// local banner re-lists current positions (rows may have been deleted), and
+// either kind of validation banner disappears once nothing is flagged.
+function syncBatchBanner() {
+  if (batchErrorKind.value === 'local') {
+    const positions = batchProblemRows.value
+    if (positions.length === 0) {
+      batchErrorKind.value = ''
+      batchSubmitError.value = ''
+    } else {
+      batchSubmitError.value = `第 ${positions.join('、')} 行未通过校验，整批尚未提交`
+    }
+  } else if (batchErrorKind.value === 'server' && batchRowErrors.value.length === 0) {
+    batchErrorKind.value = ''
+    batchSubmitError.value = ''
+  }
+}
+
+// After a successful save the result panel describes EXACTLY these rows and
+// values. Any further edit (typing, adding/removing a line) invalidates it, so
+// the panel can never present old conclusions for changed inputs.
+watch(batchRows, () => {
+  if (batchResult.value) batchResult.value = null
+}, { deep: true })
 
 // Scroll the first offending line into view so the chief officer can fix it
 // without hunting through twenty rows.
@@ -98,11 +159,13 @@ function validateLocally() {
   return Object.keys(errors).length === 0
 }
 
-// Per-row client checks build the SAME row/fields shape as the server 422, so
-// a client-blocked batch and a server-rejected batch render identically.
+// Per-row client checks build the SAME fields shape as the server 422, but
+// keyed by the row's stable uid rather than its submit-time position, so a
+// client-blocked batch and a server-rejected batch render identically and
+// markers survive row deletions correctly.
 function validateBatchLocally() {
   const rowErrs = []
-  batchRows.value.forEach((row, i) => {
+  batchRows.value.forEach((row) => {
     const fields = []
     if (!row.voyage.trim()) fields.push({ field: 'voyage', code: 'client', message: '航次代号不能为空' })
     if (!row.hatch.trim()) fields.push({ field: 'hatch', code: 'client', message: '舱号不能为空' })
@@ -120,7 +183,7 @@ function validateBatchLocally() {
     checkNum('ta', '舱内气温 Ta', -20, 60)
     checkNum('rh', '相对湿度 RH', 1, 100)
 
-    if (fields.length > 0) rowErrs.push({ row: i + 1, fields })
+    if (fields.length > 0) rowErrs.push({ uid: row.uid, fields })
   })
   return rowErrs
 }
@@ -170,6 +233,7 @@ async function submit() {
 
 async function submitBatch() {
   batchSubmitError.value = ''
+  batchErrorKind.value = ''
   batchResult.value = null
   batchRowErrors.value = []
 
@@ -178,6 +242,7 @@ async function submitBatch() {
   const localErrs = validateBatchLocally()
   if (localErrs.length > 0) {
     batchRowErrors.value = localErrs
+    batchErrorKind.value = 'local'
     batchSubmitError.value = `第 ${batchProblemRows.value.join('、')} 行未通过校验，整批尚未提交`
     await locateFirstBatchError()
     return
@@ -199,7 +264,17 @@ async function submitBatch() {
     if (res.status === 422) {
       // Whole-batch rejection: keep ALL inputs, mark each row named by the
       // server with its original field errors, and jump to the first one.
-      batchRowErrors.value = Array.isArray(res.data?.rows) ? res.data.rows : []
+      // Server row numbers are 1-based submit positions; map them to the
+      // stable uids now so later edits/deletions stay attached to the same
+      // measurement.
+      const serverRows = Array.isArray(res.data?.rows) ? res.data.rows : []
+      batchRowErrors.value = serverRows
+        .map((r) => {
+          const row = batchRows.value[r.row - 1]
+          return row ? { uid: row.uid, fields: Array.isArray(r.fields) ? r.fields : [] } : null
+        })
+        .filter((r) => r && r.fields.length > 0)
+      batchErrorKind.value = 'server'
       batchSubmitError.value = res.data?.error || '批量输入校验失败，整批未保存'
       await locateFirstBatchError()
       return
@@ -320,6 +395,7 @@ onMounted(refreshList)
                   type="text"
                   placeholder="如 V-2026-09"
                   :aria-invalid="!!batchFieldError(i, 'voyage')"
+                  @input="onBatchFieldInput(i, 'voyage')"
                 />
                 <p v-if="batchFieldError(i, 'voyage')" :id="`berr-${i}-voyage`" class="cell-err">
                   {{ batchFieldError(i, 'voyage').message }}
@@ -332,6 +408,7 @@ onMounted(refreshList)
                   type="text"
                   placeholder="如 3H"
                   :aria-invalid="!!batchFieldError(i, 'hatch')"
+                  @input="onBatchFieldInput(i, 'hatch')"
                 />
                 <p v-if="batchFieldError(i, 'hatch')" :id="`berr-${i}-hatch`" class="cell-err">
                   {{ batchFieldError(i, 'hatch').message }}
@@ -347,6 +424,7 @@ onMounted(refreshList)
                   step="0.1"
                   placeholder="-20~60"
                   :aria-invalid="!!batchFieldError(i, 'tg')"
+                  @input="onBatchFieldInput(i, 'tg')"
                 />
                 <p v-if="batchFieldError(i, 'tg')" :id="`berr-${i}-tg`" class="cell-err">
                   {{ batchFieldError(i, 'tg').message }}
@@ -362,6 +440,7 @@ onMounted(refreshList)
                   step="0.1"
                   placeholder="-20~60"
                   :aria-invalid="!!batchFieldError(i, 'ta')"
+                  @input="onBatchFieldInput(i, 'ta')"
                 />
                 <p v-if="batchFieldError(i, 'ta')" :id="`berr-${i}-ta`" class="cell-err">
                   {{ batchFieldError(i, 'ta').message }}
@@ -377,6 +456,7 @@ onMounted(refreshList)
                   step="0.1"
                   placeholder="1~100"
                   :aria-invalid="!!batchFieldError(i, 'rh')"
+                  @input="onBatchFieldInput(i, 'rh')"
                 />
                 <p v-if="batchFieldError(i, 'rh')" :id="`berr-${i}-rh`" class="cell-err">
                   {{ batchFieldError(i, 'rh').message }}
